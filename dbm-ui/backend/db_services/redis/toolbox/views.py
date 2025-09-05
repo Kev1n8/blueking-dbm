@@ -26,6 +26,7 @@ from backend.db_services.redis.toolbox.serializers import (
     GetClusterCapacityInfoSerializer,
     GetClusterModuleInfoSerializer,
     GetClusterTcpResultSerializer,
+    GetClusterVersionByIpSerializer,
     GetClusterVersionSerializer,
     ListClusterBigVersionSerializer,
     QueryByOneClusterSerializer,
@@ -93,6 +94,25 @@ class ToolboxViewSet(BaseClusterViewSet):
         for cluster_id in cluster_ids:
             if data["type"] == RedisVersionQueryType.ONLINE.value:
                 version_info = ToolboxHandler.get_online_cluster_versions(cluster_id, node_type)
+            else:
+                version_info = ToolboxHandler.get_update_cluster_versions(cluster_id, node_type)
+            data_map[cluster_id] = version_info
+        return Response(data_map)
+
+    @common_swagger_auto_schema(
+        operation_summary=_("查询指定IP版本信息"),
+        query_serializer=GetClusterVersionByIpSerializer(),
+        tags=[SWAGGER_TAG],
+    )
+    @action(methods=["GET"], detail=False, serializer_class=GetClusterVersionByIpSerializer, pagination_class=None)
+    def get_cluster_version_by_ip(self, request, bk_biz_id, **kwargs):
+        data = self.params_validate(self.get_serializer_class())
+        cluster_ids, node_type, ip = data["cluster_ids"], data["node_type"], data["ip"]
+
+        data_map = {}
+        for cluster_id in cluster_ids:
+            if data["type"] == RedisVersionQueryType.ONLINE.value:
+                version_info = ToolboxHandler.get_online_cluster_version_by_ip(cluster_id, node_type, ip)
             else:
                 version_info = ToolboxHandler.get_update_cluster_versions(cluster_id, node_type)
             data_map[cluster_id] = version_info
