@@ -111,6 +111,18 @@ func GetMongoRestoreBin(version *mymongo.MongoVersion) (bin string, err error) {
 	return binPath, nil
 }
 
+// 目前使用 /usr/local/mongodb/bin/mongoexport
+func GetMongoExportBin() (bin string, err error) {
+	bin = path.Join("/usr/local/mongodb/bin", "mongoexport")
+	if exists, err := FileExists(bin); !exists || err != nil {
+		if err != nil {
+			return "", errors.Errorf("error happened when checking %s: %v", bin, err)
+		}
+		return "", errors.Errorf("bin %s does not exist ", bin)
+	}
+	return
+}
+
 // MustFindBinPath 获取zstd的二进制文件路径
 func MustFindBinPath(bin string, pathList ...string) (binPath string) {
 	bin, err := FindBinPath(bin, pathList...)
