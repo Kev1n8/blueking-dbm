@@ -12,6 +12,7 @@ from backend.flow.engine.bamboo.scene.mongodb.mongodb_autofix import MongoAutofi
 from backend.flow.engine.bamboo.scene.mongodb.mongodb_backup import MongoBackupFlow
 from backend.flow.engine.bamboo.scene.mongodb.mongodb_cluster_add_shard import MongoDBClusterAddShardFlow
 from backend.flow.engine.bamboo.scene.mongodb.mongodb_cluster_scale_mongos import ScaleMongoSFlow
+from backend.flow.engine.bamboo.scene.mongodb.mongodb_data_export import MongoDataExportFlow
 from backend.flow.engine.bamboo.scene.mongodb.mongodb_deinstall import MongoDBDeInstallFlow
 from backend.flow.engine.bamboo.scene.mongodb.mongodb_enable_disable import MongoEnableDisableFlow
 from backend.flow.engine.bamboo.scene.mongodb.mongodb_exec_script import MongoExecScriptFlow
@@ -215,3 +216,9 @@ class MongoDBController(BaseController):
 
         flow = MongoDBClusterAddShardFlow(root_id=self.root_id, data=self.ticket_data)
         flow.multi_cluster_add_shard_flow()
+
+    def mongo_data_export(self):
+        """
+        MongoDB数据导出
+        """
+        MongoDataExportFlow(root_id=self.root_id, data=self.ticket_data).export_flow()

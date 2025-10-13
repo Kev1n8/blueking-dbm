@@ -45,7 +45,7 @@ type MongoDataExportParams struct {
 		Fields    string      `json:"fields"`     // Specific fields to export
 		Format    string      `json:"format"`     // Export format: json, csv (for mongoexport)
 	} `json:"args"`
-	FileName string `json:"file_name"` // Local and remote filename
+	FileName string `json:"filename"` // Local and remote filename
 }
 
 // UploadBkRepoParam upload to bk repo param
@@ -382,6 +382,10 @@ func (s *mongoDataExport) validateParams() error {
 		// For mongoexport, we need specific collections
 		if !s.ConfParams.Args.IsPartial {
 			return errors.New("mongoexport requires partial mode with specific collections")
+		}
+		// csv has to be used with fields
+		if s.ConfParams.Args.Format == "csv" && s.ConfParams.Args.Fields == "" {
+			return errors.New("csv format requires fields parameter")
 		}
 	}
 
