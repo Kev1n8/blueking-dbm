@@ -185,17 +185,17 @@ func (s *mongoDataExport) Run() error {
 	}
 
 	// Upload tar file to bkrepo.
-	s.runtime.Logger.Info("Upload to fileserver: %+v", s.ConfParams.UploadDetail)
 	if err := s.ConfParams.UploadDetail.Upload(s.OutputPath); err != nil {
 		s.runtime.Logger.Error("Failed to upload result tar file: %v", err)
 		return errors.Wrap(err, "uploadTarFile")
 	}
+	s.runtime.Logger.Info("Upload to to %s successfully", s.ConfParams.UploadDetail.FileServer.URL)
 
 	return errors.Wrap(s.removeDir(s.OutputPath), "deleteTarFile")
 }
 
 // doDumpData performs the actual data dump operation
-// outputPath e.g. "/data/dbbak/mongo-data-export/<domain>_<time>_<addr>" as dir
+// outputPath e.g. "/data/dbbak/mongodb-data-export/<domain>_<time>_<set_name>" as dir
 func (s *mongoDataExport) doDumpData(outputPath string) error {
 	helper := logical.NewMongoDumpHelper(s.MongoInst, s.MongoDump,
 		s.ConfParams.AdminUsername, s.ConfParams.AdminPassword, "admin", s.OsUser)

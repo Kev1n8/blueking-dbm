@@ -33,7 +33,7 @@ class MongoDataExportFlow(object):
 
     Flow流程:
     ┌──────────────────────────────────────────────┐
-    │ Main Flow (export_flow)                      │
+    │  Main Flow (export_flow)                     │
     │  - 根据 infos 整理出来 {"cluster": task_info}  │
     │  - 根据 cluster_type 调用不同 sub_flow         │
     └──────────────────────────────────────────────┘
@@ -89,7 +89,7 @@ class MongoDataExportFlow(object):
             if not cluster:
                 raise Exception(_(f"Cluster {cluster_id} not found"))
 
-            shards = cluster.get_shards()
+            shards = cluster.get_shards(with_config=False)
             if not shards:
                 raise Exception(_(f"Shards is empty for cluster: {cluster.immute_domain}"))
             cluster_tasks[cluster] = {
@@ -135,16 +135,16 @@ class MongoDataExportFlow(object):
         if cluster_pipelines:
             main_pipeline.add_parallel_sub_pipeline(cluster_pipelines)
 
-        # 导出的文件以 {"cluster_id": {"set_name": <path>}}
-        # 的形式保存在 ticket["details"]["result_files_map"]
-        main_pipeline.add_act(
-            act_name=_("保存导出文件的信息"),
-            act_component_code=StoreExportResultsComponent.code,
-            kwargs={
-                "ticket_id": self.data["ticket_id"],
-                "cluster_results": cluster_results,
-            },
-        )
+            # 导出的文件以 {"cluster_id": {"set_name": <path>}}
+            # 的形式保存在 ticket["details"]["result_files_map"]
+            main_pipeline.add_act(
+                act_name=_("保存导出文件的信息"),
+                act_component_code=StoreExportResultsComponent.code,
+                kwargs={
+                    "ticket_id": self.data["ticket_id"],
+                    "cluster_results": cluster_results,
+                },
+            )
 
         main_pipeline.run_pipeline()
 
