@@ -1035,6 +1035,9 @@ class MongoDBBackupFileTagEnum(str, StructuredEnum):
     FOREVER_BACKUP = EnumField("forever_backup", _("长期备份(3年)"))
 
 
+MONGODB_DATA_EXPORT_PATH = "mongodb-data-export/{biz}"
+
+
 class InstanceFuncAliasEnum(str, StructuredEnum):
     """
     定义实例对应的进程别名，用于注册服务实例

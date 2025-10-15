@@ -20,8 +20,7 @@ from backend.flow.engine.bamboo.scene.common.get_file_list import GetFileList
 from backend.flow.engine.bamboo.scene.mongodb.base_flow import MongoBaseFlow
 from backend.flow.engine.bamboo.scene.mongodb.sub_task.data_export import DataExportSubTask
 from backend.flow.engine.bamboo.scene.mongodb.sub_task.send_media import SendMedia
-from backend.flow.plugins.components.collections.mongodb.store_export_results import StoreExportResultsComponent
-from backend.flow.utils.mongodb.mongodb_repo import MongoRepository
+from backend.flow.utils.mongodb.mongodb_repo import MongoRepository, ReplicaSet
 from backend.flow.utils.mongodb.mongodb_util import MongoUtil
 
 logger = logging.getLogger("flow")
@@ -80,6 +79,7 @@ class MongoDataExportFlow(object):
 
         # Parse input and validate cluster existence
         cluster_tasks = {}
+        host_list = set()
         for info in self.data.get("infos", []):
             cluster_id = info["cluster_id"]
             if cluster_id in cluster_tasks:
@@ -89,37 +89,23 @@ class MongoDataExportFlow(object):
             if not cluster:
                 raise Exception(_(f"Cluster {cluster_id} not found"))
 
-            shards = cluster.get_shards(with_config=False)
-            if not shards:
-                raise Exception(_(f"Shards is empty for cluster: {cluster.immute_domain}"))
+            node = (
+                self.__pick_node(cluster.get_shards()[0])
+                if cluster.cluster_type == ClusterType.MongoReplicaSet
+                else cluster.get_mongos()[0]
+            )
+            host_list.add(node.ip)
             cluster_tasks[cluster] = {
+                "cluster": cluster,
+                "node": node,
                 "export_options": info.get("export_options", {}),
                 "ns_filter": info["ns_filter"],
-                "shards": shards,
-                "filename_prefix": info["filename_prefix"],
+                "filename": info["filename"],
             }
 
         # Process each cluster, generate subflows
         main_pipeline = Builder(root_id=self.root_id, data=self.data)
-        cluster_pipelines = []
-        host_list = set()
         actuator_workdir = MongoUtil().get_mongodb_os_conf()["file_path"]
-        cluster_results = {}
-        for cluster, task_info in cluster_tasks.items():
-            MongoBaseFlow.check_cluster_valid(cluster, self.data)
-
-            sub_flow_param = {
-                "root_id": self.root_id,
-                "ticket_data": self.data,
-                "cluster": cluster,
-                "task_info": task_info,
-                "file_path": actuator_workdir,
-            }
-            sub_flow_func = self.get_sub_flow_func(cluster.cluster_type)
-            sub_process, ips, result_map = sub_flow_func(**sub_flow_param)
-            host_list.update(ips)
-            cluster_pipelines.append(sub_process)
-            cluster_results[cluster.cluster_id] = result_map
 
         # Deliver actuator package to all target hosts first
         bk_host_list = [{"ip": ip} for ip in host_list]
@@ -132,24 +118,36 @@ class MongoDataExportFlow(object):
             )
         )
 
-        if cluster_pipelines:
-            main_pipeline.add_parallel_sub_pipeline(cluster_pipelines)
+        cluster_sub_flows = []
+        for cluster, task_info in cluster_tasks.items():
+            MongoBaseFlow.check_cluster_valid(cluster, self.data)
+            sub_flow_param = {
+                "root_id": self.root_id,
+                "data": self.data,
+                "cluster": cluster,
+                "task_info": task_info,
+                "file_path": actuator_workdir,
+            }
+            sub_flow_func = self.__get_sub_flow_func(cluster.cluster_type)
+            cluster_sub_flows.append(sub_flow_func(**sub_flow_param))
 
-            # 导出的文件以 {"cluster_id": {"set_name": <path>}}
-            # 的形式保存在 ticket["details"]["result_files_map"]
-            main_pipeline.add_act(
-                act_name=_("保存导出文件的信息"),
-                act_component_code=StoreExportResultsComponent.code,
-                kwargs={
-                    "ticket_id": self.data["ticket_id"],
-                    "cluster_results": cluster_results,
-                },
-            )
+        if cluster_sub_flows:
+            main_pipeline.add_parallel_sub_pipeline(cluster_sub_flows)
 
         main_pipeline.run_pipeline()
 
     @classmethod
-    def get_sub_flow_func(cls, cluster_type: str):
+    def __pick_node(cls, set: ReplicaSet):
+        """
+        从 ReplicaSet 中选一个 node
+        """
+        nodes = set.get_not_backup_nodes()
+        if not nodes:
+            raise Exception(_(f"ReplicaSet {set.set_name} has no nodes"))
+        return nodes[0]
+
+    @classmethod
+    def __get_sub_flow_func(cls, cluster_type: str):
         handler = cls._FLOW_HANDLERS.get(cluster_type)
         if not handler:
             raise Exception(_(f"Unknown Cluster Type: {cluster_type}"))

@@ -14,6 +14,7 @@ import time
 from django.utils.translation import ugettext_lazy as _
 from rest_framework import serializers
 
+from backend.flow.consts import MONGODB_DATA_EXPORT_PATH
 from backend.flow.engine.controller.mongodb import MongoDBController
 from backend.ticket import builders
 from backend.ticket.builders.mongodb.base import (
@@ -23,7 +24,7 @@ from backend.ticket.builders.mongodb.base import (
     Cluster,
     DBTableSerializer,
 )
-from backend.ticket.constants import TicketType
+from backend.ticket.constants import TicketFlowStatus, TicketType
 
 
 class MongoDBDataExportDetailSerializer(BaseMongoDBOperateDetailSerializer):
@@ -54,13 +55,26 @@ class MongoDBDataExportFlowParamBuilder(BaseMongoOperateFlowParamBuilder):
             if key in export_options and len(export_options[key]) == 0:
                 export_options.pop(key)
 
-        self.ticket_data["ticket_id"] = self.ticket.id
         for info in self.ticket_data["infos"]:
             pop_if_empty(info["export_options"], "query")
             pop_if_empty(info["export_options"], "fields")
 
             cluster = Cluster.objects.get(id=info["cluster_id"])
-            info["filename_prefix"] = f"{cluster.immute_domain}_{int(time.time())}"
+            info["filename"] = f"{cluster.immute_domain}_{int(time.time())}"
+
+    def post_callback(self):
+        flow = self.ticket.current_flow()
+        if not flow or flow.status != TicketFlowStatus.SUCCEEDED:
+            return
+
+        cluster_results = {}
+        for info in flow.details["ticket_data"]["infos"]:
+            cluster_id = info["cluster_id"]
+            result_file_path = "{}/{}.tar".format(
+                MONGODB_DATA_EXPORT_PATH.format(biz=self.ticket.bk_biz_id), info["filename"]
+            )
+            cluster_results[cluster_id] = result_file_path
+        self.ticket.update_details(exported_files=cluster_results)
 
 
 @builders.BuilderFactory.register(TicketType.MONGODB_DATA_EXPORT)
