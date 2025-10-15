@@ -20,7 +20,7 @@ from backend.flow.engine.bamboo.scene.common.get_file_list import GetFileList
 from backend.flow.engine.bamboo.scene.mongodb.base_flow import MongoBaseFlow
 from backend.flow.engine.bamboo.scene.mongodb.sub_task.data_export import DataExportSubTask
 from backend.flow.engine.bamboo.scene.mongodb.sub_task.send_media import SendMedia
-from backend.flow.utils.mongodb.mongodb_repo import MongoRepository, ReplicaSet
+from backend.flow.utils.mongodb.mongodb_repo import MongoDBCluster, MongoRepository
 from backend.flow.utils.mongodb.mongodb_util import MongoUtil
 
 logger = logging.getLogger("flow")
@@ -31,34 +31,33 @@ class MongoDataExportFlow(object):
     MongoDB数据导出flow
 
     Flow流程:
-    ┌──────────────────────────────────────────────┐
-    │  Main Flow (export_flow)                     │
-    │  - 根据 infos 整理出来 {"cluster": task_info}  │
-    │  - 根据 cluster_type 调用不同 sub_flow         │
-    └──────────────────────────────────────────────┘
+        ┌─────────────────────────────────────────┐
+        │  Main Flow (export_flow)                │
+        │  1. 解析 infos 并且验证 cluster           │
+        │  2. 为集群选择执行节点                     │
+        │     - ReplicaSet: shard[0] 的非备份节点   │
+        │     - ShardedCluster: mongos[0]         │
+        │  3. cluster_tasks: {cluster: task_info} │
+        └─────────────────────────────────────────┘
                             │
-                ┌───────────┴─────────────┐
-                │                         │
-                ▼                         ▼
-    ┌──────────────────────┐   ┌──────────────────────────┐
-    │ replica_set_sub_flow │   │ sharded_cluster_sub_flow │
-    │ - Single shard       │   │ - Multiple shards        │
-    │                      │   │ - Parallel export        │
-    └──────────────────────┘   └──────────────────────────┘
-                │                       │
-                └───────────┬───────────┘
                             ▼
-                    ┌────────────────┐
-                    │ __export_shard │
-                    │ - Select node  │
-                    │ - Make kwargs  │
-                    │ - Return act   │
-                    └────────────────┘
-                            │
+                  ┌──────────────────┐
+                  │   SendMedia Act  │
+                  └──────────────────┘
+                            │ Export clusters in parallel
+            ┌───────────────┴───────────────┐
+            ▼                               ▼
+    ┌──────────────────┐          ┌──────────────────┐
+    │ Cluster 1 Export │          │ Cluster N Export │
+    │ SubFlow          │   ...    │ SubFlow          │
+    └──────────────────┘          └──────────────────┘
+            └───────────────┬───────────────┘
                             ▼
                 ┌───────────────────────────┐
-                │ StoreExportResults        │
-                │ - Store result files path │
+                │ DataExportSubTask         │
+                │ .export_cluster_sub_flow  │
+                │ - Make kwargs             │
+                │ - ExecJobComponent2       │
                 └───────────────────────────┘
     """
 
@@ -66,52 +65,52 @@ class MongoDataExportFlow(object):
         """
         传入参数
         """
-
         self.root_id = root_id
         self.data = data
+        self.cluster_tasks = {}
+        self.host_list = set()
+        self.parse_infos()
 
-    def export_flow(self):
+    def parse_infos(self):
         """
-        mongo_data_export 流程
+        将 infos 解析为 {cluster: task_info}
         """
-        logger.debug("MongoDataExportFlow start, payload", self.data)
-        file_list = GetFileList(db_type=DBType.MongoDB).get_db_actuator_package()
-
-        # Parse input and validate cluster existence
-        cluster_tasks = {}
-        host_list = set()
+        cluster_seened = set()
         for info in self.data.get("infos", []):
             cluster_id = info["cluster_id"]
-            if cluster_id in cluster_tasks:
+            if cluster_id in cluster_seened:
                 raise Exception(_(f"Duplicate cluster_id found: {cluster_id}"))
+            cluster_seened.add(cluster_id)
 
             cluster = MongoRepository.fetch_one_cluster(id=cluster_id)
             if not cluster:
                 raise Exception(_(f"Cluster {cluster_id} not found"))
+            MongoBaseFlow.check_cluster_valid(cluster, self.data)
 
-            node = (
-                self.__pick_node(cluster.get_shards()[0])
-                if cluster.cluster_type == ClusterType.MongoReplicaSet
-                else cluster.get_mongos()[0]
-            )
-            host_list.add(node.ip)
-            cluster_tasks[cluster] = {
-                "cluster": cluster,
+            node = self.__pick_node(cluster)
+            self.host_list.add(node.ip)
+            self.cluster_tasks[cluster] = {
                 "node": node,
                 "export_options": info.get("export_options", {}),
                 "ns_filter": info["ns_filter"],
                 "filename": info["filename"],
             }
+        logger.debug("MongoDataExportFlow payload parsed", self.cluster_tasks)
 
-        # Process each cluster, generate subflows
+    def export_flow(self):
+        """
+        mongo_data_export 流程
+        """
+
         main_pipeline = Builder(root_id=self.root_id, data=self.data)
+        file_list = GetFileList(db_type=DBType.MongoDB).get_db_actuator_package()
+        bk_host_list = [{"ip": ip} for ip in self.host_list]
         actuator_workdir = MongoUtil().get_mongodb_os_conf()["file_path"]
 
         # Deliver actuator package to all target hosts first
-        bk_host_list = [{"ip": ip} for ip in host_list]
         main_pipeline.add_act(
             **SendMedia.act(
-                act_name=_("MongoDB-介质下发({})".format(len(host_list))),
+                act_name=_("MongoDB-介质下发({})".format(len(self.host_list))),
                 file_list=file_list,
                 bk_host_list=bk_host_list,
                 file_target_path=actuator_workdir,
@@ -119,8 +118,7 @@ class MongoDataExportFlow(object):
         )
 
         cluster_sub_flows = []
-        for cluster, task_info in cluster_tasks.items():
-            MongoBaseFlow.check_cluster_valid(cluster, self.data)
+        for cluster, task_info in self.cluster_tasks.items():
             sub_flow_param = {
                 "root_id": self.root_id,
                 "data": self.data,
@@ -128,8 +126,7 @@ class MongoDataExportFlow(object):
                 "task_info": task_info,
                 "file_path": actuator_workdir,
             }
-            sub_flow_func = self.__get_sub_flow_func(cluster.cluster_type)
-            cluster_sub_flows.append(sub_flow_func(**sub_flow_param))
+            cluster_sub_flows.append(DataExportSubTask.export_cluster_sub_flow(**sub_flow_param))
 
         if cluster_sub_flows:
             main_pipeline.add_parallel_sub_pipeline(cluster_sub_flows)
@@ -137,23 +134,18 @@ class MongoDataExportFlow(object):
         main_pipeline.run_pipeline()
 
     @classmethod
-    def __pick_node(cls, set: ReplicaSet):
+    def __pick_node(cls, cluster: MongoDBCluster):
         """
-        从 ReplicaSet 中选一个 node
+        选择集群目标节点
         """
-        nodes = set.get_not_backup_nodes()
+        match cluster.cluster_type:
+            case ClusterType.MongoReplicaSet:
+                nodes = cluster.get_shards()[0].get_not_backup_nodes()
+            case ClusterType.MongoShardedCluster:
+                nodes = cluster.get_mongos()
+            case _:
+                raise Exception(_(f"Unsupported cluster type: {cluster.cluster_type}"))
+
         if not nodes:
-            raise Exception(_(f"ReplicaSet {set.set_name} has no nodes"))
+            raise Exception(_(f"cluster: {cluster.immute_domain} has no valid nodes"))
         return nodes[0]
-
-    @classmethod
-    def __get_sub_flow_func(cls, cluster_type: str):
-        handler = cls._FLOW_HANDLERS.get(cluster_type)
-        if not handler:
-            raise Exception(_(f"Unknown Cluster Type: {cluster_type}"))
-        return handler
-
-    _FLOW_HANDLERS = {
-        ClusterType.MongoReplicaSet: DataExportSubTask.replica_set_sub_flow,
-        ClusterType.MongoShardedCluster: DataExportSubTask.sharded_cluster_sub_flow,
-    }

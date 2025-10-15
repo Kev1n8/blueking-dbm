@@ -10,7 +10,6 @@ specific language governing permissions and limitations under the License.
 """
 import logging
 from dataclasses import dataclass
-from typing import Tuple
 
 from django.conf import settings
 from django.utils.translation import ugettext as _
@@ -32,6 +31,7 @@ logger = logging.getLogger("flow")
 class ExportConfig:
     """Configuration for MongoDB data export operations."""
 
+    node: MongoNode
     ns_filter: dict
     export_options: dict
     filename: str
@@ -44,19 +44,20 @@ class DataExportSubTask(BaseSubTask):
     """
 
     @classmethod
-    def make_kwargs(cls, cluster: MongoDBCluster, node: MongoNode, config: ExportConfig) -> dict:
+    def make_kwargs(cls, cluster: MongoDBCluster, config: ExportConfig) -> dict:
         """
         Create kwargs for the MongoDB data export actuator job.
         """
+        node = config.node
         bk_dbm_instance = MongoNodeWithLabel.from_node(node, clu=cluster)
         dba_user, dba_pwd = MongoUtil().get_dba_user_password(node.ip, node.port, node.bk_cloud_id)
-
         is_partial = MongoDBNsFilter.is_partial(config.ns_filter)
         is_dumping = config.export_options["format"] == "bson"
         sudo_account = MongoUtil().get_mongodb_os_conf()["user"]
         db_cloud_token = AsymmetricHandler.encrypt(
             name=AsymmetricCipherConfigType.PROXYPASS, content=f"{node.bk_cloud_id}_dbactuator_token"
         )
+
         return {
             "set_trans_data_dataclass": CommonContext.__name__,
             "get_trans_data_ip_var": None,
@@ -99,50 +100,24 @@ class DataExportSubTask(BaseSubTask):
         }
 
     @classmethod
-    def __export_act(cls, cluster: MongoDBCluster, node: MongoNode, config: ExportConfig) -> Tuple[dict, MongoNode]:
+    def export_cluster_sub_flow(cls, root_id, data, cluster: MongoDBCluster, task_info: dict, file_path: str):
         """
-        Generate act of data export.
+        Create a cluster export sub flow.
         """
-        kwargs = cls.make_kwargs(cluster, node, config)
 
-        return {
-            "act_name": _("目标实例: {}".format(node.addr())),
-            "act_component_code": ExecJobComponent2.code,
-            "kwargs": kwargs,
-        }
-
-    @classmethod
-    def replica_set_sub_flow(cls, root_id, data, cluster: MongoDBCluster, task_info: dict, file_path: str):
-        """
-        ReplicaSet Data Export
-        """
-        logger.info(f"Exporting data from ReplicaSet {cluster.name}")
         builder = SubBuilder(root_id=root_id, data=data)
         config = ExportConfig(
+            node=task_info["node"],
             ns_filter=task_info["ns_filter"],
             export_options=task_info["export_options"],
             filename=task_info["filename"],
             file_path=file_path,
         )
+        kwargs = cls.make_kwargs(cluster, config)
 
-        act = cls.__export_act(cluster, task_info["node"], config)
-        builder.add_act(**act)
-        return builder.build_sub_process(_(f"{cluster.immute_domain}-数据导出"))
-
-    @classmethod
-    def sharded_cluster_sub_flow(cls, root_id, data, cluster: MongoDBCluster, task_info: dict, file_path: str):
-        """
-        ShardedCluster Data Export
-        """
-        logger.info(f"Exporting data from ShardedCluster {cluster.name}")
-        builder = SubBuilder(root_id=root_id, data=data)
-        config = ExportConfig(
-            ns_filter=task_info["ns_filter"],
-            export_options=task_info["export_options"],
-            filename=task_info["filename"],
-            file_path=file_path,
+        builder.add_act(
+            act_name=_("目标实例: {}".format(config.node.addr())),
+            act_component_code=ExecJobComponent2.code,
+            kwargs=kwargs,
         )
-
-        act = cls.__export_act(cluster, task_info["node"], config)
-        builder.add_act(**act)
         return builder.build_sub_process(_(f"{cluster.immute_domain}-数据导出"))
