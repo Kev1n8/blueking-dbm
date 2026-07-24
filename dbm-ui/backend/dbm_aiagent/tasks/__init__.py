@@ -7,9 +7,26 @@ You may obtain a copy of the License at https://opensource.org/licenses/MIT
 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
+
+AI agent task adapter on top of ``backend.db_periodic_task.dispatch``.
+
+Extension docs live in code comments/docstrings:
+- ``dbm_aiagent.tasks.base.AITask`` for hooks and execution behavior.
+- ``dbm_aiagent.tasks.registry.ai_task`` for registration examples.
 """
-# Importing this module ensures failure handlers are registered with the
-# shared dispatch worker (idempotent via Celery dispatch_uid).
+
 from backend.db_periodic_task.dispatch.registry import register_failure_handlers
+from backend.dbm_aiagent.tasks.base import AITask
+from backend.dbm_aiagent.tasks.config import (
+    AI_NAMESPACE,
+    DEFAULT_AGENT_INVOKE_TIMEOUT_SECONDS,
+    DEFAULT_LOOKBACK_DAYS,
+    AITaskConfig,
+    AITaskQueueConfig,
+)
+from backend.dbm_aiagent.tasks.invoker import AgentInvoker, AgentRequest
+from backend.dbm_aiagent.tasks.outcomes import SKIP_REPORT_MSG_PREFIX, AgentOutcome, DispatchOutcomeType
+from backend.dbm_aiagent.tasks.queue import AITaskQueue
+from backend.dbm_aiagent.tasks.registry import ai_task
 
 register_failure_handlers()

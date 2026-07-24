@@ -13,6 +13,7 @@ import json
 import logging
 from datetime import timedelta
 
+from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils import timezone
 from django.utils.translation import gettext
@@ -87,6 +88,100 @@ class DBPeriodicTask(AuditedModel):
                 celery_task.save(update_fields=[model_field, "args", "kwargs"])
 
         return db_task
+
+
+class DispatchQueueSettings(AuditedModel):
+    """Persisted settings for one Redis dispatch queue namespace."""
+
+    namespace = models.CharField(_("队列命名空间"), max_length=128, unique=True)
+    config = models.JSONField(_("配置覆盖项"), default=dict, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = _("Dispatch队列设置")
+        ordering = ["namespace"]
+
+    def __str__(self):
+        return self.namespace
+
+    def clean(self):
+        super().clean()
+        from backend.db_periodic_task.dispatch.config import DispatchQueueConfig
+        from backend.db_periodic_task.dispatch.queue import DispatchQueue
+
+        queue_cls = DispatchQueue.queue_for_namespace(self.namespace)
+        config_cls = queue_cls.config_cls if queue_cls else DispatchQueueConfig
+        config_cls.validate_raw(self.config)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+        # Invalidate after commit so concurrent loaders cannot refill the cache
+        # from the pre-commit DB snapshot (e.g. Admin save + watch_queue).
+        namespace = self.namespace
+        transaction.on_commit(lambda: _invalidate_queue_config(namespace))
+
+    def delete(self, *args, **kwargs):
+        namespace = self.namespace
+        result = super().delete(*args, **kwargs)
+        transaction.on_commit(lambda: _invalidate_queue_config(namespace))
+        return result
+
+
+class DispatchTaskSettings(AuditedModel):
+    """Persisted settings for one registered dispatch task."""
+
+    queue = models.ForeignKey(
+        DispatchQueueSettings,
+        verbose_name=_("队列设置"),
+        related_name="task_settings",
+        on_delete=models.PROTECT,
+    )
+    task_key = models.CharField(_("任务唯一标识"), max_length=255, unique=True)
+    config = models.JSONField(_("配置覆盖项"), default=dict, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = _("Dispatch任务设置")
+        ordering = ["queue__namespace", "task_key"]
+        indexes = [models.Index(fields=["queue", "task_key"], name="idx_dispatch_queue_task")]
+
+    def __str__(self):
+        return self.task_key
+
+    def clean(self):
+        super().clean()
+        from backend.db_periodic_task.dispatch.registry import DISPATCH_REGISTRY
+
+        task_cls = DISPATCH_REGISTRY.get(self.task_key)
+        if task_cls:
+            if self.queue_id and self.queue.namespace != task_cls.namespace:
+                raise ValidationError({"queue": f"task {self.task_key} belongs to namespace {task_cls.namespace}"})
+            task_cls.config_cls.validate_raw(self.config)
+        elif not isinstance(self.config, dict):
+            raise ValidationError({"config": "must be a JSON object"})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+        task_key = self.task_key
+        transaction.on_commit(lambda: _invalidate_task_config(task_key))
+
+    def delete(self, *args, **kwargs):
+        task_key = self.task_key
+        result = super().delete(*args, **kwargs)
+        transaction.on_commit(lambda: _invalidate_task_config(task_key))
+        return result
+
+
+def _invalidate_queue_config(namespace: str) -> None:
+    from backend.db_periodic_task.dispatch.config_cache import DispatchSettingsCache
+
+    DispatchSettingsCache.invalidate_queue(namespace)
+
+
+def _invalidate_task_config(task_key: str) -> None:
+    from backend.db_periodic_task.dispatch.config_cache import DispatchSettingsCache
+
+    DispatchSettingsCache.invalidate_task(task_key)
 
 
 class TaskStatus:
