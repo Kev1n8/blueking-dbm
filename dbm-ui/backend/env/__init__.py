@@ -34,6 +34,13 @@ REDIS_PORT = get_type_env(key="REDIS_PORT", _type=int, default=6379)
 REDIS_PASSWORD = get_type_env(key="REDIS_PASSWORD", _type=str, default="")
 REDIS_URL = f"redis://{f':{REDIS_PASSWORD}@' if REDIS_PASSWORD else ''}{REDIS_HOST}:{REDIS_PORT}/1"
 
+# Dispatch 队列 Redis 池：逗号分隔的 URL 列表；未配置则回落 REDIS_URL
+# 例：DISPATCH_REDIS_URLS=redis://:pwd@a:6379/1,redis://:pwd@b:6379/1
+# 密码含逗号需 URL 编码为 %2C；default Redis 仅保留 dispatch:registered
+DISPATCH_REDIS_URL_LIST = [url for url in get_type_env(key="DISPATCH_REDIS_URLS", default=[], _type=list) if url] or [
+    REDIS_URL
+]
+
 BROKER_URL = get_type_env(key="BROKER_URL", default=REDIS_URL, _type=str)
 SESSION_COOKIE_DOMAIN = get_type_env(key="SESSION_COOKIE_DOMAIN", default="", _type=str)
 

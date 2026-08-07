@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Optional
 
+from backend.db_periodic_task.dispatch import routing
 from backend.db_periodic_task.dispatch.config import (
     PUMP_CLEANUP_INTERVAL_SECONDS,
     PUMP_INTERVAL_SECONDS,
@@ -27,6 +28,7 @@ from backend.db_periodic_task.dispatch.config import (
 from backend.db_periodic_task.dispatch.controller import PumpControlDecision, PumpController
 from backend.db_periodic_task.dispatch.job import DispatchJob
 from backend.db_periodic_task.dispatch.lifecycle import QueueLifecycle
+from backend.db_periodic_task.dispatch.lua import RELEASE_LOCK_LUA, compile_script, eval_script
 from backend.db_periodic_task.dispatch.metrics import DispatchMetrics, _text, tick_id
 from backend.db_periodic_task.dispatch.queue import DispatchQueue, set_redis_ttl_marker
 from backend.db_periodic_task.dispatch.reaper import OrphanReaper
@@ -38,39 +40,33 @@ from backend.db_periodic_task.dispatch.reservation import (
 )
 from backend.db_periodic_task.dispatch.task_members import TaskMembers
 from backend.db_periodic_task.register import register_periodic_task
-from backend.utils.redis import RedisConn
 
 logger = logging.getLogger("root")
 
-PUMP_LOCK_KEY_PREFIX = "dispatch:pump_lock:"
-PUMP_CLEANUP_KEY_PREFIX = "dispatch:pump_cleanup:"
-# Occupies ``dispatch:pump_lock:{ns}`` so SET NX acquisition fails until resume / TTL.
+PUMP_LOCK_KEY_PREFIX = "dispatch:{ns}:pump_lock"
+PUMP_CLEANUP_KEY_PREFIX = "dispatch:{ns}:pump_cleanup"
+# Occupies ``dispatch:{ns}:pump_lock`` so SET NX acquisition fails until resume / TTL.
 PUMP_PAUSE_OWNER = "dispatch:paused"
 # Pause/resume advances this baseline so intentional downtime is not counted as ``pump_missed``.
-PUMP_MISSED_BASELINE_KEY_PREFIX = "dispatch:pump_missed_baseline:"
+PUMP_MISSED_BASELINE_KEY_PREFIX = "dispatch:{ns}:pump_missed_baseline"
 PUMP_MISSED_BASELINE_TTL_SECONDS = 24 * 3600
 
-RELEASE_LOCK_LUA = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-    return redis.call('DEL', KEYS[1])
-end
-return 0
-"""
-_release_lock_script = None
+_release_lock_script = compile_script(RELEASE_LOCK_LUA)
 
 
 def _pump_lock_key(namespace: str) -> str:
-    return f"{PUMP_LOCK_KEY_PREFIX}{namespace}"
+    return PUMP_LOCK_KEY_PREFIX.format(ns=namespace)
 
 
 def _pump_missed_baseline_key(namespace: str) -> str:
-    return f"{PUMP_MISSED_BASELINE_KEY_PREFIX}{namespace}"
+    return PUMP_MISSED_BASELINE_KEY_PREFIX.format(ns=namespace)
 
 
-def _mark_pump_missed_baseline(namespace: str, *, current_tick: Optional[int] = None) -> None:
+def _mark_pump_missed_baseline(namespace: str, *, current_tick: Optional[int] = None, client=None) -> None:
     """Ignore missed ticks at or before ``current_tick`` (pause / resume)."""
     try:
-        RedisConn.set(
+        client = client or routing.conn_for_namespace(namespace)
+        client.set(
             _pump_missed_baseline_key(namespace),
             int(tick_id() if current_tick is None else current_tick),
             ex=PUMP_MISSED_BASELINE_TTL_SECONDS,
@@ -79,9 +75,9 @@ def _mark_pump_missed_baseline(namespace: str, *, current_tick: Optional[int] = 
         logger.debug("dispatch_global_pump[%s]: missed baseline write failed: %s", namespace, exc)
 
 
-def _read_pump_missed_baseline(namespace: str) -> int:
+def _read_pump_missed_baseline(namespace: str, *, client=None) -> int:
     try:
-        raw = RedisConn.get(_pump_missed_baseline_key(namespace))
+        raw = (client or routing.conn_for_namespace(namespace)).get(_pump_missed_baseline_key(namespace))
     except Exception:
         return -1
     if raw is None:
@@ -120,53 +116,61 @@ def _record_pump_missed_ticks(queue_cls: type[DispatchQueue], current_tick_id: i
     return missed
 
 
-def pause_queue_pump(namespace: str, *, seconds: Optional[float] = None) -> dict:
+def pause_queue_pump(namespace: str, *, seconds: Optional[float] = None, alias: Optional[str] = None) -> dict:
     """Hold the per-namespace pump lock so ``dispatch_global_pump`` skips this queue.
 
     ``seconds=None`` keeps the pause until ``resume_queue_pump`` (no Redis TTL).
     Otherwise the pause auto-expires after ``ceil(seconds)`` (≥1).
+    ``alias`` pins the Redis shard explicitly (used by remap so the pause lands
+    on the old shard even while the route row is about to flip).
     """
     ns = namespace or ""
     if not ns:
         raise ValueError("namespace is required to pause a queue pump")
     key = _pump_lock_key(ns)
-    _mark_pump_missed_baseline(ns)
+    client = routing.conn_for_alias(alias) if alias else routing.conn_for_namespace(ns)
+    _mark_pump_missed_baseline(ns, client=client)  # setting baseline here matters less than resuming pump
     if seconds is None:
-        RedisConn.set(key, PUMP_PAUSE_OWNER)
+        client.set(key, PUMP_PAUSE_OWNER)
         logger.warning("dispatch_global_pump[%s]: paused until resume", ns)
         return {"namespace": ns, "paused": True, "ttl_seconds": None}
     if float(seconds) <= 0:
         raise ValueError("seconds must be positive; use seconds=None to pause until resume")
     ttl = max(1, int(math.ceil(float(seconds))))
-    RedisConn.set(key, PUMP_PAUSE_OWNER, ex=ttl)
+    client.set(key, PUMP_PAUSE_OWNER, ex=ttl)
     logger.warning("dispatch_global_pump[%s]: paused for %ss", ns, ttl)
     return {"namespace": ns, "paused": True, "ttl_seconds": ttl}
 
 
-def resume_queue_pump(namespace: str) -> bool:
+def resume_queue_pump(namespace: str, *, alias: Optional[str] = None) -> bool:
     """Clear a pause marker on the pump lock. Returns whether a pause key was removed."""
     ns = namespace or ""
     if not ns:
         raise ValueError("namespace is required to resume a queue pump")
-    global _release_lock_script
-    if _release_lock_script is None:
-        _release_lock_script = RedisConn.register_script(RELEASE_LOCK_LUA)
-    removed = bool(_release_lock_script(keys=[_pump_lock_key(ns)], args=[PUMP_PAUSE_OWNER]))
+    client = routing.conn_for_alias(alias) if alias else routing.conn_for_namespace(ns)
+    removed = bool(
+        eval_script(
+            _release_lock_script,
+            client=client,
+            keys=[_pump_lock_key(ns)],
+            args=[PUMP_PAUSE_OWNER],
+        )
+    )
     # Always advance baseline on resume so pause downtime is not counted as starvation.
-    _mark_pump_missed_baseline(ns)
+    _mark_pump_missed_baseline(ns, client=client)
     if removed:
         logger.warning("dispatch_global_pump[%s]: resumed", ns)
     return removed
 
 
-def inspect_queue_pump_lock(namespace: str) -> dict:
-    """Inspect who holds ``dispatch:pump_lock:{ns}``.
+def inspect_queue_pump_lock(namespace: str, *, alias: Optional[str] = None) -> dict:
+    """Inspect who holds ``dispatch:{ns}:pump_lock``.
 
     Returns::
 
         {
             "namespace": "...",
-            "key": "dispatch:pump_lock:...",
+            "key": "dispatch:{ns}:pump_lock",
             "held": bool,
             "owner": str | None,          # raw Redis value
             "state": "free" | "paused" | "pumping" | "held",
@@ -186,14 +190,14 @@ def inspect_queue_pump_lock(namespace: str) -> dict:
     if not ns:
         return empty
     try:
-        raw = RedisConn.get(key)
+        raw = (routing.conn_for_alias(alias) if alias else routing.conn_for_namespace(ns)).get(key)
     except Exception:
         return empty
     if raw is None:
         return empty
     owner = _text(raw)
     try:
-        ttl = int(RedisConn.ttl(key))
+        ttl = int((routing.conn_for_alias(alias) if alias else routing.conn_for_namespace(ns)).ttl(key))
     except Exception:
         ttl = None
     else:
@@ -216,17 +220,17 @@ def inspect_queue_pump_lock(namespace: str) -> dict:
     }
 
 
-def is_queue_pump_paused(namespace: str) -> bool:
+def is_queue_pump_paused(namespace: str, *, alias: Optional[str] = None) -> bool:
     """Whether the namespace pump lock is currently held by a pause marker."""
-    return inspect_queue_pump_lock(namespace)["state"] == "paused"
+    return inspect_queue_pump_lock(namespace, alias=alias)["state"] == "paused"
 
 
-def queue_pump_pause_ttl(namespace: str) -> Optional[int]:
+def queue_pump_pause_ttl(namespace: str, *, alias: Optional[str] = None) -> Optional[int]:
     """Remaining pause TTL in seconds.
 
     ``None`` when not paused. ``-1`` when paused with no expiry (until resume).
     """
-    info = inspect_queue_pump_lock(namespace)
+    info = inspect_queue_pump_lock(namespace, alias=alias)
     if info["state"] != "paused":
         return None
     return info["ttl_seconds"]
@@ -245,9 +249,10 @@ class _PumpTickStats:
 
 def _cleanup_due(queue_cls: type[DispatchQueue], interval_seconds: int) -> bool:
     return set_redis_ttl_marker(
-        f"{PUMP_CLEANUP_KEY_PREFIX}{queue_cls.namespace}",
+        PUMP_CLEANUP_KEY_PREFIX.format(ns=queue_cls.namespace),
         interval_seconds,
         nx=True,
+        client=queue_cls.conn(),
     )
 
 
@@ -359,7 +364,7 @@ def _dispatch_candidates(
                 dispatch_execute_job.apply_async(args=[job.job_id])
             except Exception as exc:
                 stats.publish_failed += 1
-                DispatchMetrics.record_task_counter(job.task_key, "publish_failed")
+                DispatchMetrics.record_task_counter(queue_cls._ns(), job.task_key, "publish_failed")
                 _requeue_reserved_tail(queue_cls, chunk, statuses, index)
                 logger.warning(
                     "dispatch_global_pump[%s]: publish failed job_id=%s: %s",
@@ -378,7 +383,7 @@ def _flush_pump_metrics(
     started_at: float,
 ) -> None:
     try:
-        pipe = RedisConn.pipeline(transaction=False)
+        pipe = queue_cls.conn().pipeline(transaction=False)
         for name, amount in (
             ("candidates", stats.candidates),
             ("reserved", stats.reserved),
@@ -452,18 +457,27 @@ def _pump_queue(queue_cls: type[DispatchQueue], deadline_at: float, current_tick
 
 def _try_acquire_pump_lock(namespace: str, owner: str, ttl_seconds: int) -> bool:
     try:
-        return bool(RedisConn.set(_pump_lock_key(namespace), owner, nx=True, ex=max(1, int(ttl_seconds))))
+        return bool(
+            routing.conn_for_namespace(namespace).set(
+                _pump_lock_key(namespace),
+                owner,
+                nx=True,
+                ex=max(1, int(ttl_seconds)),
+            )
+        )
     except Exception as exc:
         logger.warning("dispatch_global_pump[%s]: lock acquisition failed: %s", namespace, exc)
         return False
 
 
 def _release_pump_lock(namespace: str, owner: str) -> None:
-    global _release_lock_script
     try:
-        if _release_lock_script is None:
-            _release_lock_script = RedisConn.register_script(RELEASE_LOCK_LUA)
-        _release_lock_script(keys=[_pump_lock_key(namespace)], args=[owner])
+        eval_script(
+            _release_lock_script,
+            client=routing.conn_for_namespace(namespace),
+            keys=[_pump_lock_key(namespace)],
+            args=[owner],
+        )
     except Exception as exc:
         logger.warning("dispatch_global_pump[%s]: lock release failed: %s", namespace, exc)
 

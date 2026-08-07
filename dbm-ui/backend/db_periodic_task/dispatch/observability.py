@@ -15,14 +15,14 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional, TextIO
 
+from backend.db_periodic_task.dispatch import routing
 from backend.db_periodic_task.dispatch.config import PUMP_INTERVAL_SECONDS, DispatchPumpConfig
 from backend.db_periodic_task.dispatch.controller import PumpController
-from backend.db_periodic_task.dispatch.metrics import DispatchMetrics, tick_id
+from backend.db_periodic_task.dispatch.metrics import HOUR_SECONDS, METRICS_WINDOW_SECONDS, DispatchMetrics, tick_id
 from backend.db_periodic_task.dispatch.queue import KEY_REGISTERED, DispatchQueue
-from backend.utils.redis import RedisConn
 
-DEFAULT_REPORT_WINDOW_SECONDS = 60 * 60
-MAX_REPORT_WINDOW_SECONDS = 24 * 60 * 60
+DEFAULT_REPORT_WINDOW_SECONDS = HOUR_SECONDS
+MAX_REPORT_WINDOW_SECONDS = METRICS_WINDOW_SECONDS
 DISTRIBUTION_NAMES = ("queue_wait_seconds", "execution_seconds", "pump_seconds")
 _BAR_WIDTH = 20
 _ANSI_CLEAR = "\033[2J\033[H"
@@ -109,6 +109,7 @@ _FLOW_COUNTERS = (
 _ISSUE_COUNTERS = (
     ("enqueue_duplicate", "dup"),
     ("enqueue_capacity_rejected", "cap_reject"),
+    ("enqueue_producer_rejected", "prod_reject"),
     ("enqueue_unavailable", "unavail"),
     ("blocked", "blocked"),
     ("congestion", "congest"),
@@ -180,6 +181,7 @@ class QueueDispatchReport:
     counters: dict[str, int]
     distributions: dict[str, dict[str, Any]]
     pump_lock: dict[str, Any] = field(default_factory=dict)
+    producer_lock: dict[str, Any] = field(default_factory=dict)
     diagnosis: list[str] = field(default_factory=list)
     partial: bool = False
     last_tick_id: int = 0
@@ -193,10 +195,11 @@ class QueueDispatchReport:
         cwnd = self.controller.get("congestion_window", "?")
         flow = self.controller.get("flow_window", "?")
         pump_state = str(self.pump_lock.get("state") or "unknown")
+        producer_state = str(self.producer_lock.get("state") or "unknown")
         lines = [
             (
                 f"dispatch queue[{self.namespace}] @ {_fmt_epoch(self.timestamp)} "
-                f"partial={self.partial} pump={pump_state}"
+                f"partial={self.partial} pump={pump_state} producer={producer_state}"
             ),
             f"  pending={self.pending_total} ready={self.pending_ready} delaying={self.pending_delaying}",
             f"  inflight={self.inflight} budget={budget} flow={flow} cwnd={cwnd} {limits}",
@@ -237,6 +240,14 @@ class QueueDispatchReport:
                 pump_label += "(until_resume)"
             elif pump_ttl is not None:
                 pump_label += f"({_fmt_int(pump_ttl)}s)"
+        producer_state = str(self.producer_lock.get("state") or "unknown")
+        producer_ttl = self.producer_lock.get("ttl_seconds")
+        producer_label = producer_state
+        if producer_state == "paused":
+            if producer_ttl == -1:
+                producer_label += "(until_resume)"
+            elif producer_ttl is not None:
+                producer_label += f"({_fmt_int(producer_ttl)}s)"
         decide_tick = self.controller.get("tick_id", "")
         try:
             decide_tick_id = int(decide_tick)
@@ -252,11 +263,13 @@ class QueueDispatchReport:
 
         issues = [item for item in self.diagnosis if item != "healthy"]
         status = (
-            "PAUSED" if pump_state == "paused" else ("PARTIAL" if self.partial else ("WARN" if issues else "HEALTHY"))
+            "PAUSED"
+            if pump_state == "paused" or producer_state == "paused"
+            else ("PARTIAL" if self.partial else ("WARN" if issues else "HEALTHY"))
         )
         header = (
             f"dispatch[{self.namespace}]  {_fmt_epoch(self.timestamp)}  "
-            f"status={status}  pump={pump_label}  window={_fmt_window(self.window_seconds)}"
+            f"status={status}  pump={pump_label}  producer={producer_label}  window={_fmt_window(self.window_seconds)}"
         )
         rule = "-" * max(100, len(header))
         lines = [
@@ -447,6 +460,11 @@ class DispatchStats:
 
         pump_lock_raw = inspect_queue_pump_lock(namespace)
         pump_lock = pump_lock_raw if isinstance(pump_lock_raw, dict) else {}
+        # Deferred import: producer.py only pulls in lua + routing.
+        from backend.db_periodic_task.dispatch.producer import inspect_queue_producer_lock
+
+        producer_lock_raw = inspect_queue_producer_lock(namespace)
+        producer_lock = producer_lock_raw if isinstance(producer_lock_raw, dict) else {}
         observed_tick = tick_id(now)
         last_tick_id = observed_tick - 1
         try:
@@ -468,6 +486,7 @@ class DispatchStats:
             counters=counters,
             distributions=distributions,
             pump_lock=pump_lock,
+            producer_lock=producer_lock,
             partial=partial,
             last_tick_id=last_tick_id,
             last_tick_counts=last_tick_counts,
@@ -491,6 +510,7 @@ class DispatchStats:
         pending, inflight = queue_cls.task_counts(task_key) if queue_cls else (-1, -1)
         backlog = pending + inflight if pending >= 0 and inflight >= 0 else -1
         counters = DispatchMetrics.aggregate_task_counters(
+            namespace,
             task_key,
             start_at=now - window_seconds,
             end_at=now,
@@ -569,6 +589,9 @@ class DispatchStats:
             delta = _decide_tick_delta(report.controller, report.last_tick_id)
             if delta is not None and delta < 0:
                 diagnosis.append("pump_delayed")
+        producer_state = str(report.producer_lock.get("state") or "")
+        if producer_state == "paused":
+            diagnosis.append("producer_paused")
         max_inflight = int(report.config.get("max_inflight", 0) or 0)
         if max_inflight and report.inflight >= max_inflight:
             diagnosis.append("inflight_saturated")
@@ -600,8 +623,10 @@ class DispatchStats:
         ]
         outcomes = []
         if include_outcomes:
-            for task_key in registered:
+            for task_key, metadata in registered.items():
+                namespace = metadata.get("namespace", "") if isinstance(metadata, dict) else ""
                 counters = DispatchMetrics.aggregate_task_counters(
+                    namespace,
                     task_key,
                     start_at=now - window_seconds,
                     end_at=now,
@@ -632,7 +657,7 @@ class DispatchStats:
     @staticmethod
     def _load_registered() -> dict[str, Any]:
         try:
-            raw = RedisConn.hgetall(KEY_REGISTERED) or {}
+            raw = routing.global_conn().hgetall(KEY_REGISTERED) or {}
             result = {}
             for key, value in raw.items():
                 key = key.decode() if isinstance(key, bytes) else key

@@ -15,16 +15,16 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
+from backend.db_periodic_task.dispatch import routing
 from backend.db_periodic_task.dispatch.config import DispatchQueueConfig
 from backend.db_periodic_task.dispatch.metrics import AIMD_TICK_COUNTER_NAMES, DispatchMetrics, tick_id
 from backend.db_periodic_task.dispatch.queue import DispatchQueue
-from backend.utils.redis import RedisConn
 
 logger = logging.getLogger("root")
 
 MD_FACTOR = 0.5
 CONTROLLER_STATE_TTL_SECONDS = 10 * 60
-KEY_CONTROLLER_PREFIX = "dispatch:controller:"
+KEY_CONTROLLER_PREFIX = "dispatch:{ns}:controller"
 
 AIMD_INCREASE = "increase"
 AIMD_DECREASE = "decrease"
@@ -75,7 +75,7 @@ class PumpController:
 
     @staticmethod
     def state_key(namespace: str) -> str:
-        return f"{KEY_CONTROLLER_PREFIX}{namespace}"
+        return KEY_CONTROLLER_PREFIX.format(ns=namespace)
 
     @classmethod
     def decide(
@@ -111,7 +111,7 @@ class PumpController:
         increase_step = _additive_increase_step(max_inflight)
         cold_window = _cold_start_window(max_inflight)
         try:
-            state = _decode_mapping(RedisConn.hgetall(cls.state_key(namespace)) or {})
+            state = _decode_mapping(routing.conn_for_namespace(namespace).hgetall(cls.state_key(namespace)) or {})
             previous = DispatchMetrics.queue_tick_counts(
                 namespace,
                 current_tick_id - 1,
@@ -242,7 +242,7 @@ class PumpController:
                 name: int(value) if isinstance(value, bool) else value for name, value in asdict(decision).items()
             }
             mapping["updated_at"] = time.time()
-            pipe = RedisConn.pipeline(transaction=False)
+            pipe = routing.conn_for_namespace(decision.namespace).pipeline(transaction=False)
             pipe.hset(cls.state_key(decision.namespace), mapping=mapping)
             pipe.expire(cls.state_key(decision.namespace), CONTROLLER_STATE_TTL_SECONDS)
             pipe.execute()
@@ -252,7 +252,9 @@ class PumpController:
     @classmethod
     def read_state(cls, namespace: str) -> dict[str, Any]:
         try:
-            state: dict[str, Any] = _decode_mapping(RedisConn.hgetall(cls.state_key(namespace)) or {})
+            state: dict[str, Any] = _decode_mapping(
+                routing.conn_for_namespace(namespace).hgetall(cls.state_key(namespace)) or {}
+            )
             for name in (
                 "tick_id",
                 "effective_budget",

@@ -14,10 +14,10 @@ import logging
 import time
 from enum import IntEnum
 
-from backend.db_periodic_task.dispatch.config import DEFAULT_QUEUE_WAIT_TTL_SECONDS
 from backend.db_periodic_task.dispatch.job import DispatchJob, compute_wait_deadline
-from backend.db_periodic_task.dispatch.lua import register_script_once
+from backend.db_periodic_task.dispatch.lua import compile_script, eval_script
 from backend.db_periodic_task.dispatch.metrics import DispatchMetrics
+from backend.db_periodic_task.dispatch.queue import TASK_MEMBERS_CACHE_TTL_SECONDS
 
 logger = logging.getLogger("root")
 
@@ -29,6 +29,7 @@ local inflight = KEYS[2]
 local task_metrics = KEYS[3]
 local queue_metrics = KEYS[4]
 local task_members = KEYS[5]
+local producer_gate = KEYS[6]
 local max_admitted = tonumber(ARGV[1])
 local check_dedupe = tonumber(ARGV[2])
 local task_field_prefix = ARGV[3]
@@ -42,6 +43,8 @@ local admitted = redis.call('ZCARD', pending) + redis.call('ZCARD', inflight)
 local accepted_count = 0
 local metric_counts = {}
 local statuses = {}
+-- Producer gate: one EXISTS per admission batch, atomic with the writes below.
+local producer_paused = (redis.call('EXISTS', producer_gate) == 1)
 
 local function finish(index, status, metric_name)
     statuses[index] = status
@@ -50,7 +53,7 @@ local function finish(index, status, metric_name)
 end
 
 for index = 1, job_count do
-    local key_offset = 5 + ((index - 1) * 2)
+    local key_offset = 6 + ((index - 1) * 2)
     local arg_offset = 8 + ((index - 1) * 4)
     local job_record = KEYS[key_offset + 1]
     local dedupe_key = KEYS[key_offset + 2]
@@ -60,7 +63,14 @@ for index = 1, job_count do
     local record_ttl = tonumber(ARGV[arg_offset + 4])
     local decided = false
 
-    if check_dedupe == 1 then
+    -- Closed producer gate rejects everything before dedupe / capacity: a
+    -- paused producer must never consume queue slots or dedupe identities.
+    if producer_paused then
+        finish(index, -4, 'enqueue_producer_rejected')
+        decided = true
+    end
+
+    if not decided and check_dedupe == 1 then
         if redis.call('ZSCORE', pending, job_id) ~= false then
             finish(index, -1, 'enqueue_duplicate')
             decided = true
@@ -122,6 +132,7 @@ class EnqueueStatus(IntEnum):
     UNAVAILABLE = -2
     DUPLICATE = -1
     DEADLINE_EXPIRED = -3
+    PRODUCER_REJECTED = -4
     CAPACITY_REJECTED = 0
     ACCEPTED = 1
 
@@ -129,7 +140,7 @@ class EnqueueStatus(IntEnum):
 class QueueAdmission:
     """Atomically admit jobs under admitted capacity and optional dedupe."""
 
-    _enqueue_script = register_script_once(ENQUEUE_JOBS_LUA)
+    _enqueue_script = compile_script(ENQUEUE_JOBS_LUA)
 
     @classmethod
     def enqueue_jobs(
@@ -177,6 +188,7 @@ class QueueAdmission:
                 task_metrics,
                 queue_metrics,
                 queue_cls.task_members_key(),
+                queue_cls.producer_lock_key(),
             ]
             args = [
                 max(1, int(max_admitted_jobs)),
@@ -185,7 +197,7 @@ class QueueAdmission:
                 queue_prefix,
                 metrics_ttl,
                 task_key or "",
-                DEFAULT_QUEUE_WAIT_TTL_SECONDS,
+                TASK_MEMBERS_CACHE_TTL_SECONDS,
                 len(prepared),
             ]
             for _index, job, ttl in prepared:
@@ -204,7 +216,7 @@ class QueueAdmission:
                     ]
                 )
             try:
-                results = cls._enqueue_script(keys=keys, args=args)
+                results = eval_script(cls._enqueue_script, client=queue_cls.conn(), keys=keys, args=args)
                 if len(prepared) == 1 and not isinstance(results, (list, tuple)):
                     results = [results]
                 for (index, _job, _ttl), result in zip(prepared, results):

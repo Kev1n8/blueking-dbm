@@ -7,37 +7,37 @@ import uuid
 from datetime import timedelta
 from typing import Optional
 
+from backend.db_periodic_task.dispatch import routing
 from backend.db_periodic_task.dispatch.config import (
     TASK_MEMBERS_REBUILD_DEADLINE_SECONDS,
     TASK_MEMBERS_REBUILD_LOCK_SECONDS,
     TASK_MEMBERS_REBUILD_PERIOD_SECONDS,
 )
-from backend.db_periodic_task.dispatch.lua import register_script_once
+from backend.db_periodic_task.dispatch.lua import compile_script, eval_script
 from backend.db_periodic_task.dispatch.queue import DispatchQueue
 from backend.db_periodic_task.dispatch.task_members import TaskMembers
 from backend.db_periodic_task.register import register_periodic_task
-from backend.utils.redis import RedisConn
 
 logger = logging.getLogger("root")
 
-TASK_MEMBERS_REBUILD_LOCK_PREFIX = "dispatch:task_members_rebuild_lock:"
+TASK_MEMBERS_REBUILD_LOCK_PREFIX = "dispatch:{ns}:task_members_rebuild_lock"
 RELEASE_REBUILD_LOCK_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
     return redis.call('DEL', KEYS[1])
 end
 return 0
 """
-_release_rebuild_lock_script = register_script_once(RELEASE_REBUILD_LOCK_LUA)
+_release_rebuild_lock_script = compile_script(RELEASE_REBUILD_LOCK_LUA)
 
 
 def _rebuild_lock_key(namespace: str) -> str:
-    return f"{TASK_MEMBERS_REBUILD_LOCK_PREFIX}{namespace}"
+    return TASK_MEMBERS_REBUILD_LOCK_PREFIX.format(ns=namespace)
 
 
 def _try_acquire_rebuild_lock(namespace: str, owner: str) -> bool:
     try:
         return bool(
-            RedisConn.set(
+            routing.conn_for_namespace(namespace).set(
                 _rebuild_lock_key(namespace),
                 owner,
                 nx=True,
@@ -51,7 +51,12 @@ def _try_acquire_rebuild_lock(namespace: str, owner: str) -> bool:
 
 def _release_rebuild_lock(namespace: str, owner: str) -> None:
     try:
-        _release_rebuild_lock_script(keys=[_rebuild_lock_key(namespace)], args=[owner])
+        eval_script(
+            _release_rebuild_lock_script,
+            client=routing.conn_for_namespace(namespace),
+            keys=[_rebuild_lock_key(namespace)],
+            args=[owner],
+        )
     except Exception as exc:
         logger.warning("dispatch maintenance: lock release failed namespace=%s: %s", namespace, exc)
 

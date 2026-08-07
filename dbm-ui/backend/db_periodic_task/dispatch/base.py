@@ -23,6 +23,7 @@ from backend.db_periodic_task.dispatch.metrics import DispatchMetrics
 from backend.db_periodic_task.dispatch.outcomes import DispatchOutcome, DispatchOutcomeType
 from backend.db_periodic_task.dispatch.queue import DispatchQueue
 from backend.db_periodic_task.dispatch.reaper import OrphanReaper
+from backend.db_periodic_task.dispatch.routing import candidate_namespaces, namespace_for_job_id
 from backend.db_periodic_task.dispatch.scheduling import ExecuteAtSpec, resolve_execute_at
 
 logger = logging.getLogger("root")
@@ -32,6 +33,7 @@ _ENQUEUE_OUTCOME_BY_STATUS = {
     EnqueueStatus.DUPLICATE: DispatchOutcomeType.ENQUEUE_DUPLICATE,
     EnqueueStatus.CAPACITY_REJECTED: DispatchOutcomeType.ENQUEUE_CAPACITY_REJECTED,
     EnqueueStatus.DEADLINE_EXPIRED: DispatchOutcomeType.ENQUEUE_DEADLINE_EXPIRED,
+    EnqueueStatus.PRODUCER_REJECTED: DispatchOutcomeType.ENQUEUE_PRODUCER_REJECTED,
     EnqueueStatus.UNAVAILABLE: DispatchOutcomeType.ENQUEUE_UNAVAILABLE,
 }
 _ENQUEUE_METRIC_BY_OUTCOME = {
@@ -39,6 +41,7 @@ _ENQUEUE_METRIC_BY_OUTCOME = {
     DispatchOutcomeType.ENQUEUE_DUPLICATE: "enqueue_duplicate",
     DispatchOutcomeType.ENQUEUE_CAPACITY_REJECTED: "enqueue_capacity_rejected",
     DispatchOutcomeType.ENQUEUE_DEADLINE_EXPIRED: "enqueue_deadline_expired",
+    DispatchOutcomeType.ENQUEUE_PRODUCER_REJECTED: "enqueue_producer_rejected",
     DispatchOutcomeType.ENQUEUE_UNAVAILABLE: "enqueue_unavailable",
 }
 
@@ -124,11 +127,37 @@ class DispatchTask(ABC):
 
     @classmethod
     def fetch_queued_job(cls, job_id: str) -> Optional[DispatchJob]:
-        # Job payloads are stored globally (namespace-agnostic).
-        return DispatchQueue.get_job(job_id)
+        """Fetch a worker-side job payload through its namespace shard.
+
+        ``job_id`` alone does not carry the namespace, so the primary path is
+        in-process registry resolution. For unregistered task keys the payload
+        key is namespace-bound and cannot be guessed: fan out over registered
+        queue namespaces plus persisted route namespaces and stop at the first
+        payload. No hit means the delivery is already missing.
+        """
+        namespace = namespace_for_job_id(job_id)
+        if namespace:
+            queue_cls = DispatchQueue.queue_for_namespace(namespace) or DispatchQueue.ephemeral_queue_for_namespace(
+                namespace
+            )
+            return queue_cls.get_job(job_id)
+        # fallback path
+        for ns in sorted(candidate_namespaces()):
+            queue_cls = DispatchQueue.queue_for_namespace(ns) or DispatchQueue.ephemeral_queue_for_namespace(ns)
+            job = queue_cls.get_job(job_id)
+            if job:
+                return job
+        return None
 
     @classmethod
     def discard_orphaned_job(cls, job_id: str) -> None:
+        namespace = namespace_for_job_id(job_id)
+        if namespace:
+            queue_cls = DispatchQueue.queue_for_namespace(namespace) or DispatchQueue.ephemeral_queue_for_namespace(
+                namespace
+            )
+            OrphanReaper.discard_orphaned_job(queue_cls, job_id)
+            return
         OrphanReaper.discard_orphaned_job(DispatchQueue, job_id)
 
     def has_pending_work(self) -> bool:
@@ -349,13 +378,21 @@ class DispatchTask(ABC):
         job = cls.fetch_queued_job(job_id)
         if not job:
             logger.warning("dispatch_execute: job not found job_id=%s", job_id)
-            cls.discard_orphaned_job(job_id)
+            if namespace_for_job_id(job_id):
+                # Registered task whose payload TTL expired: clean any leftovers.
+                cls.discard_orphaned_job(job_id)
+            else:
+                # Unregistered task key with no payload anywhere: already
+                # missing, nothing trustworthy to finalize or attribute.
+                logger.warning("dispatch_execute: unregistered task_key with no payload job_id=%s", job_id)
             return
 
         task_cls = DISPATCH_REGISTRY.get(job.task_key)
         if not task_cls:
             logger.error("dispatch_execute: unknown task_key=%s job_id=%s", job.task_key, job_id)
-            queue_cls = DispatchQueue.queue_for_namespace(job.namespace) or cls.queue_cls
+            queue_cls = DispatchQueue.queue_for_namespace(
+                job.namespace
+            ) or DispatchQueue.ephemeral_queue_for_namespace(job.namespace)
             queue_cls.record_outcome(job.task_key, DispatchOutcomeType.ERROR)
             QueueLifecycle.finalize_job(
                 queue_cls=queue_cls,

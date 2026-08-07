@@ -14,8 +14,8 @@ import logging
 import time
 
 from backend.db_periodic_task.dispatch.job import DispatchJob, compute_wait_deadline
-from backend.db_periodic_task.dispatch.lua import register_script_once
-from backend.db_periodic_task.dispatch.queue import TASK_MEMBERS_TTL_SECONDS
+from backend.db_periodic_task.dispatch.lua import compile_script, eval_script
+from backend.db_periodic_task.dispatch.queue import TASK_MEMBERS_CACHE_TTL_SECONDS
 
 logger = logging.getLogger("root")
 
@@ -60,8 +60,8 @@ end
 return removed
 """
 
-_finalize_script = register_script_once(FINALIZE_JOB_LUA)
-_requeue_script = register_script_once(REQUEUE_JOB_LUA)
+_finalize_script = compile_script(FINALIZE_JOB_LUA)
+_requeue_script = compile_script(REQUEUE_JOB_LUA)
 
 
 class QueueLifecycle:
@@ -80,13 +80,15 @@ class QueueLifecycle:
         job_id: str,
         task_key: str = "",
         work_item_id: str = "",
-        task_members_ttl: int = TASK_MEMBERS_TTL_SECONDS,
+        task_members_ttl: int = TASK_MEMBERS_CACHE_TTL_SECONDS,
     ) -> int:
         """Atomically flush terminal job-record, inflight, and dedupe cleanup."""
         try:
             dedupe_key = queue_cls.dedupe_key(task_key, work_item_id) if task_key and work_item_id else ""
             return int(
-                _finalize_script(
+                eval_script(
+                    _finalize_script,
+                    client=queue_cls.conn(),
                     keys=[
                         queue_cls._job_key(job_id),
                         queue_cls.inflight_key(),
@@ -115,11 +117,13 @@ class QueueLifecycle:
         job_ttl: int,
         score: float,
         task_key: str = "",
-        task_members_ttl: int = TASK_MEMBERS_TTL_SECONDS,
+        task_members_ttl: int = TASK_MEMBERS_CACHE_TTL_SECONDS,
     ) -> int:
         """Requeue a job and refresh the rebuildable task-count hash TTL."""
         return int(
-            _requeue_script(
+            eval_script(
+                _requeue_script,
+                client=queue_cls.conn(),
                 keys=[
                     queue_cls._job_key(job_id),
                     queue_cls.inflight_key(),

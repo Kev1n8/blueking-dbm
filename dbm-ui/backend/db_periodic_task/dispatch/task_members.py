@@ -14,6 +14,7 @@ import time
 from collections import defaultdict
 from typing import Optional
 
+from backend.db_periodic_task.dispatch import routing
 from backend.db_periodic_task.dispatch.config import (
     TASK_MEMBERS_REBUILD_FORCE_SECONDS,
     TASK_MEMBERS_REBUILD_REQUEST_TTL_SECONDS,
@@ -22,15 +23,14 @@ from backend.db_periodic_task.dispatch.config import (
     TASK_MEMBERS_REBUILD_SCAN_PAUSE_SECONDS,
 )
 from backend.db_periodic_task.dispatch.job import resolve_task_key_from_job_id
-from backend.db_periodic_task.dispatch.lua import register_script_once
+from backend.db_periodic_task.dispatch.lua import compile_script, eval_script
 from backend.db_periodic_task.dispatch.metrics import _text
 from backend.db_periodic_task.dispatch.queue import (
     KEY_REGISTERED,
-    TASK_MEMBERS_TTL_SECONDS,
+    TASK_MEMBERS_CACHE_TTL_SECONDS,
     DispatchQueue,
     set_redis_ttl_marker,
 )
-from backend.utils.redis import RedisConn
 
 logger = logging.getLogger("root")
 
@@ -62,7 +62,7 @@ if field_count > 0 then
 end
 return 1
 """
-_replace_task_members_script = register_script_once(REPLACE_TASK_MEMBERS_LUA)
+_replace_task_members_script = compile_script(REPLACE_TASK_MEMBERS_LUA)
 
 
 def _parse_task_member_field(field: str) -> Optional[tuple[str, str]]:
@@ -142,7 +142,7 @@ class TaskMembers:
     def hard_rebuild_due(cls, queue_cls: type[DispatchQueue]) -> bool:
         """True when the daily hard-audit safety window has expired."""
         try:
-            return not bool(RedisConn.exists(cls._rebuilt_key(queue_cls)))
+            return not bool(queue_cls.conn().exists(cls._rebuilt_key(queue_cls)))
         except Exception as exc:
             logger.warning(
                 "dispatch: task_members hard-rebuild check failed namespace=%s: %s",
@@ -154,7 +154,7 @@ class TaskMembers:
     @classmethod
     def rebuild_requested(cls, queue_cls: type[DispatchQueue]) -> bool:
         try:
-            return bool(RedisConn.exists(cls._rebuild_requested_key(queue_cls)))
+            return bool(queue_cls.conn().exists(cls._rebuild_requested_key(queue_cls)))
         except Exception as exc:
             logger.warning(
                 "dispatch: task_members rebuild-request check failed namespace=%s: %s",
@@ -167,7 +167,7 @@ class TaskMembers:
     def request_rebuild(cls, queue_cls: type[DispatchQueue], reason: str) -> bool:
         """Request out-of-band repair without scanning from the pump."""
         try:
-            RedisConn.set(
+            queue_cls.conn().set(
                 cls._rebuild_requested_key(queue_cls),
                 str(reason or "unspecified"),
                 ex=TASK_MEMBERS_REBUILD_REQUEST_TTL_SECONDS,
@@ -189,13 +189,14 @@ class TaskMembers:
             cls._rebuild_attempt_key(queue_cls),
             TASK_MEMBERS_REBUILD_RETRY_SECONDS,
             nx=True,
+            client=queue_cls.conn(),
         )
 
     @classmethod
     def mark_rebuilt(cls, queue_cls: type[DispatchQueue]) -> bool:
         """Commit successful daily audit state and clear request/backoff."""
         try:
-            pipe = RedisConn.pipeline(transaction=False)
+            pipe = queue_cls.conn().pipeline(transaction=False)
             pipe.set(cls._rebuilt_key(queue_cls), "1", ex=TASK_MEMBERS_REBUILD_FORCE_SECONDS)
             pipe.delete(
                 cls._rebuild_requested_key(queue_cls),
@@ -219,7 +220,7 @@ class TaskMembers:
             inflight_z = queue_cls.inflight_count()
             if pending_z < 0 or inflight_z < 0:
                 return False
-            raw = RedisConn.hgetall(queue_cls.task_members_key()) or {}
+            raw = queue_cls.conn().hgetall(queue_cls.task_members_key()) or {}
         except Exception as exc:
             logger.warning(
                 "dispatch: task_members drift check failed namespace=%s: %s",
@@ -254,7 +255,7 @@ class TaskMembers:
         while True:
             if deadline_at is not None and time.monotonic() >= deadline_at:
                 return None
-            cursor, members = RedisConn.zscan(zset_key, cursor, count=max(1, int(scan_count)))
+            cursor, members = queue_cls.conn().zscan(zset_key, cursor, count=max(1, int(scan_count)))
             pages += 1
             scanned += len(members or [])
             for raw_id, _score in members or []:
@@ -283,12 +284,14 @@ class TaskMembers:
             expected_pending,
             expected_inflight,
             len(mapping),
-            TASK_MEMBERS_TTL_SECONDS,
+            TASK_MEMBERS_CACHE_TTL_SECONDS,
         ]
         for field, value in mapping.items():
             args.extend([field, value])
         return bool(
-            _replace_task_members_script(
+            eval_script(
+                _replace_task_members_script,
+                client=queue_cls.conn(),
                 keys=[
                     queue_cls.pending_key(),
                     queue_cls.inflight_key(),
@@ -315,7 +318,7 @@ class TaskMembers:
         """
         started_at = time.monotonic()
         try:
-            registered = [_text(key) for key in (RedisConn.hkeys(KEY_REGISTERED) or [])]
+            registered = [_text(key) for key in (routing.global_conn().hkeys(KEY_REGISTERED) or [])]
         except Exception:
             registered = []
 

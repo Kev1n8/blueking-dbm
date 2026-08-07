@@ -11,6 +11,7 @@ specific language governing permissions and limitations under the License.
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from backend.db_periodic_task.dispatch.config import DISPATCH_RATE_LIMIT_COOLDOWN_SECONDS
 from blue_krill.data_types.enum import EnumField, StrStructuredEnum
 
 
@@ -26,6 +27,10 @@ class DispatchOutcomeType(StrStructuredEnum):
     ENQUEUED = EnumField("enqueued", "Producer enqueued work item")
     ENQUEUE_DUPLICATE = EnumField("enqueue_duplicate", "Producer skipped enqueue due to dedupe")
     ENQUEUE_CAPACITY_REJECTED = EnumField("enqueue_capacity_rejected", "Queue admitted capacity exhausted")
+    ENQUEUE_PRODUCER_REJECTED = EnumField(
+        "enqueue_producer_rejected",
+        "Producer gate closed; submission rejected without enqueue",
+    )
     ENQUEUE_DEADLINE_EXPIRED = EnumField(
         "enqueue_deadline_expired",
         "Wait deadline expired before the job could be enqueued; never retried",
@@ -43,5 +48,5 @@ class DispatchOutcome:
     error: Optional[Exception] = None
     elapsed_seconds: float = -1.0
     should_requeue: bool = False
-    requeue_cooldown_seconds: int = 60
+    requeue_cooldown_seconds: int = DISPATCH_RATE_LIMIT_COOLDOWN_SECONDS
     extra: dict = field(default_factory=dict)

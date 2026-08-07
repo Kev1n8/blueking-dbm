@@ -22,7 +22,7 @@ from backend.db_periodic_task.dispatch.job import DispatchJob, resolve_task_key_
 from backend.db_periodic_task.dispatch.lifecycle import QueueLifecycle
 from backend.db_periodic_task.dispatch.queue import (
     DISPATCH_QUEUE_REGISTRY,
-    TASK_MEMBERS_TTL_SECONDS,
+    TASK_MEMBERS_CACHE_TTL_SECONDS,
     DispatchQueue,
     DispatchQueueError,
 )
@@ -400,6 +400,7 @@ class TestPumpQueue:
         queue.get_jobs.return_value = {job.job_id: job for job in jobs}
 
         pipeline = MagicMock()
+        queue.conn.return_value.pipeline.return_value = pipeline
         with patch("backend.db_periodic_task.dispatch.pump._cleanup_due", return_value=False), patch(
             "backend.db_periodic_task.dispatch.pump.PumpController.decide",
             return_value=SimpleNamespace(
@@ -410,9 +411,6 @@ class TestPumpQueue:
             ),
         ), self._reserve([ReservationStatus.RESERVED] * 3, pump_module), patch(
             "backend.db_periodic_task.dispatch.pump.dispatch_execute_job.apply_async"
-        ), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.pipeline",
-            return_value=pipeline,
         ), patch(
             "backend.db_periodic_task.dispatch.pump.DispatchMetrics.record_sample"
         ) as record_sample, patch(
@@ -597,13 +595,16 @@ class TestGlobalPump:
         def redis_set(key, *_args, **_kwargs):
             return True
 
+        redis_client = MagicMock()
+        redis_client.set.side_effect = redis_set
         release_script = MagicMock(return_value=1)
         with patch.object(DispatchQueue, "iter_queues", return_value=queues), patch(
             "backend.db_periodic_task.dispatch.pump.DispatchPumpConfig", return_value=config
-        ), patch("backend.db_periodic_task.dispatch.pump.RedisConn.set", side_effect=redis_set), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.register_script", return_value=release_script
         ), patch(
-            "backend.db_periodic_task.dispatch.pump._release_lock_script", None
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis_client,
+        ), patch.object(
+            pump_module, "_release_lock_script", release_script
         ), patch(
             "backend.db_periodic_task.dispatch.pump._pump_queue", side_effect=pump_one
         ):
@@ -633,7 +634,7 @@ class TestPumpPause:
                 return -2
             return -1 if item["ex"] is None else int(item["ex"])
 
-        def release_side_effect(keys, args):
+        def release_side_effect(keys, args, **kwargs):
             key = keys[0]
             item = store.get(key)
             if item and item["value"] == args[0]:
@@ -643,23 +644,24 @@ class TestPumpPause:
 
         release_script = MagicMock(side_effect=release_side_effect)
 
-        with patch("backend.db_periodic_task.dispatch.pump.RedisConn.set", side_effect=redis_set), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.get", side_effect=redis_get
-        ), patch("backend.db_periodic_task.dispatch.pump.RedisConn.ttl", side_effect=redis_ttl), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.register_script", return_value=release_script
-        ), patch(
-            "backend.db_periodic_task.dispatch.pump._release_lock_script", release_script
-        ):
+        redis_client = MagicMock()
+        redis_client.set.side_effect = redis_set
+        redis_client.get.side_effect = redis_get
+        redis_client.ttl.side_effect = redis_ttl
+        with patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis_client,
+        ), patch.object(pump_module, "_release_lock_script", release_script):
             info = pump_module.pause_queue_pump("default", seconds=None)
             assert info == {"namespace": "default", "paused": True, "ttl_seconds": None}
             assert pump_module.is_queue_pump_paused("default") is True
             assert pump_module.queue_pump_pause_ttl("default") == -1
-            assert store["dispatch:pump_lock:default"]["value"] == pump_module.PUMP_PAUSE_OWNER
-            assert store["dispatch:pump_lock:default"]["ex"] is None
+            assert store["dispatch:default:pump_lock"]["value"] == pump_module.PUMP_PAUSE_OWNER
+            assert store["dispatch:default:pump_lock"]["ex"] is None
 
             assert pump_module.resume_queue_pump("default") is True
             assert pump_module.is_queue_pump_paused("default") is False
-            assert "dispatch:pump_lock:default" not in store
+            assert "dispatch:default:pump_lock" not in store
 
     def test_inspect_pump_lock_distinguishes_pause_and_pump(self, pump_module):
         store = {}
@@ -674,18 +676,22 @@ class TestPumpPause:
                 return -2
             return -1 if item["ex"] is None else int(item["ex"])
 
-        with patch("backend.db_periodic_task.dispatch.pump.RedisConn.get", side_effect=redis_get), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.ttl", side_effect=redis_ttl
+        redis_client = MagicMock()
+        redis_client.get.side_effect = redis_get
+        redis_client.ttl.side_effect = redis_ttl
+        with patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis_client,
         ):
             assert pump_module.inspect_queue_pump_lock("default")["state"] == "free"
 
-            store["dispatch:pump_lock:default"] = {"value": pump_module.PUMP_PAUSE_OWNER, "ex": None}
+            store["dispatch:default:pump_lock"] = {"value": pump_module.PUMP_PAUSE_OWNER, "ex": None}
             paused = pump_module.inspect_queue_pump_lock("default")
             assert paused["state"] == "paused"
             assert paused["owner"] == pump_module.PUMP_PAUSE_OWNER
             assert paused["ttl_seconds"] == -1
 
-            store["dispatch:pump_lock:default"] = {"value": "pump:default:abc123", "ex": 11}
+            store["dispatch:default:pump_lock"] = {"value": "pump:default:abc123", "ex": 11}
             pumping = pump_module.inspect_queue_pump_lock("default")
             assert pumping["state"] == "pumping"
             assert pumping["owner"] == "pump:default:abc123"
@@ -709,12 +715,17 @@ class TestPumpPause:
                 return -2
             return -1 if item["ex"] is None else int(item["ex"])
 
-        with patch("backend.db_periodic_task.dispatch.pump.RedisConn.set", side_effect=redis_set), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.get", side_effect=redis_get
-        ), patch("backend.db_periodic_task.dispatch.pump.RedisConn.ttl", side_effect=redis_ttl):
+        redis_client = MagicMock()
+        redis_client.set.side_effect = redis_set
+        redis_client.get.side_effect = redis_get
+        redis_client.ttl.side_effect = redis_ttl
+        with patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis_client,
+        ):
             info = pump_module.pause_queue_pump("default", seconds=90.2)
             assert info["ttl_seconds"] == 91
-            assert store["dispatch:pump_lock:default"]["ex"] == 91
+            assert store["dispatch:default:pump_lock"]["ex"] == 91
             assert pump_module.queue_pump_pause_ttl("default") == 91
 
     @pytest.mark.parametrize("paused", [False, True])
@@ -728,19 +739,19 @@ class TestPumpPause:
             return 1
 
         def redis_set(key, value, nx=False, ex=None, **_kwargs):
-            if key == "dispatch:pump_lock:a" and nx:
+            if key == "dispatch:a:pump_lock" and nx:
                 return False
             return True
 
+        redis_client = MagicMock()
+        redis_client.set.side_effect = redis_set
         with patch.object(DispatchQueue, "iter_queues", return_value=queues), patch(
             "backend.db_periodic_task.dispatch.pump.DispatchPumpConfig", return_value=config
-        ), patch("backend.db_periodic_task.dispatch.pump.RedisConn.set", side_effect=redis_set), patch(
+        ), patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=redis_client,), patch(
             "backend.db_periodic_task.dispatch.pump.is_queue_pump_paused",
             return_value=paused,
-        ), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.register_script", return_value=MagicMock(return_value=1)
-        ), patch(
-            "backend.db_periodic_task.dispatch.pump._release_lock_script", None
+        ), patch.object(
+            pump_module, "_release_lock_script", MagicMock(return_value=1)
         ), patch(
             "backend.db_periodic_task.dispatch.pump._pump_queue", side_effect=pump_one
         ):
@@ -749,9 +760,9 @@ class TestPumpPause:
         assert started == ["b"]
 
     def test_resume_does_not_clear_live_pump_lock(self, pump_module):
-        store = {"dispatch:pump_lock:default": {"value": "pump:default:abc", "ex": 11}}
+        store = {"dispatch:default:pump_lock": {"value": "pump:default:abc", "ex": 11}}
 
-        def release_side_effect(keys, args):
+        def release_side_effect(keys, args, **kwargs):
             key = keys[0]
             item = store.get(key)
             if item and item["value"] == args[0]:
@@ -760,18 +771,88 @@ class TestPumpPause:
             return 0
 
         release_script = MagicMock(side_effect=release_side_effect)
-        with patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.register_script", return_value=release_script
-        ), patch("backend.db_periodic_task.dispatch.pump._release_lock_script", release_script), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.get",
-            return_value="pump:default:abc",
-        ), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.set",
-            return_value=True,
+        redis_client = MagicMock()
+        redis_client.get.return_value = "pump:default:abc"
+        redis_client.set.return_value = True
+        with patch.object(pump_module, "_release_lock_script", release_script), patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis_client,
         ):
             assert pump_module.resume_queue_pump("default") is False
-            assert store["dispatch:pump_lock:default"]["value"] == "pump:default:abc"
+            assert store["dispatch:default:pump_lock"]["value"] == "pump:default:abc"
             assert pump_module.is_queue_pump_paused("default") is False
+
+    def test_producer_gate_pause_until_resume(self):
+        import backend.db_periodic_task.dispatch.producer as producer_module
+
+        store = {}
+
+        def redis_set(key, value, ex=None, **_kwargs):
+            store[key] = {"value": value, "ex": ex}
+            return True
+
+        def redis_get(key):
+            item = store.get(key)
+            return None if item is None else item["value"]
+
+        def redis_ttl(key):
+            item = store.get(key)
+            if item is None:
+                return -2
+            return -1 if item["ex"] is None else int(item["ex"])
+
+        def release_side_effect(keys, args, **kwargs):
+            item = store.get(keys[0])
+            if item and item["value"] == args[0]:
+                store.pop(keys[0])
+                return 1
+            return 0
+
+        redis_client = MagicMock()
+        redis_client.set.side_effect = redis_set
+        redis_client.get.side_effect = redis_get
+        redis_client.ttl.side_effect = redis_ttl
+        with patch.object(producer_module, "_release_lock_script", MagicMock(side_effect=release_side_effect)), patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis_client,
+        ):
+            info = producer_module.pause_queue_producer("default", seconds=None)
+            assert info == {"namespace": "default", "paused": True, "ttl_seconds": None}
+            assert producer_module.is_queue_producer_paused("default") is True
+            assert producer_module.queue_producer_pause_ttl("default") == -1
+            assert store["dispatch:default:producer_lock"]["value"] == producer_module.PRODUCER_PAUSE_OWNER
+            assert store["dispatch:default:producer_lock"]["ex"] is None
+
+            assert producer_module.resume_queue_producer("default") is True
+            assert producer_module.is_queue_producer_paused("default") is False
+            assert "dispatch:default:producer_lock" not in store
+
+    def test_producer_gate_ttl_auto_expires(self):
+        import backend.db_periodic_task.dispatch.producer as producer_module
+
+        store = {}
+
+        def redis_set(key, value, ex=None, **_kwargs):
+            store[key] = {"value": value, "ex": ex}
+            return True
+
+        redis_client = MagicMock()
+        redis_client.set.side_effect = redis_set
+        with patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis_client,
+        ):
+            info = producer_module.pause_queue_producer("default", seconds=1.9)
+            assert info == {"namespace": "default", "paused": True, "ttl_seconds": 2}
+            assert store["dispatch:default:producer_lock"]["ex"] == 2
+
+    def test_producer_gate_requires_namespace(self):
+        import backend.db_periodic_task.dispatch.producer as producer_module
+
+        with pytest.raises(ValueError):
+            producer_module.pause_queue_producer("")
+        with pytest.raises(ValueError):
+            producer_module.resume_queue_producer("")
 
     def test_record_pump_missed_ticks_backfills_gap(self, pump_module):
         with patch.object(pump_module.PumpController, "read_state", return_value={"tick_id": 100}), patch.object(
@@ -818,7 +899,7 @@ class TestPumpPause:
             item = store.get(key)
             return None if item is None else item["value"]
 
-        def release_side_effect(keys, args):
+        def release_side_effect(keys, args, **kwargs):
             key = keys[0]
             item = store.get(key)
             if item and item["value"] == args[0]:
@@ -828,13 +909,14 @@ class TestPumpPause:
 
         release_script = MagicMock(side_effect=release_side_effect)
         baseline_key = pump_module._pump_missed_baseline_key("default")
-        with patch("backend.db_periodic_task.dispatch.pump.RedisConn.set", side_effect=redis_set), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.get", side_effect=redis_get
-        ), patch("backend.db_periodic_task.dispatch.pump.RedisConn.ttl", return_value=-1), patch(
-            "backend.db_periodic_task.dispatch.pump.RedisConn.register_script", return_value=release_script
-        ), patch(
-            "backend.db_periodic_task.dispatch.pump._release_lock_script", release_script
-        ), patch(
+        redis_client = MagicMock()
+        redis_client.set.side_effect = redis_set
+        redis_client.get.side_effect = redis_get
+        redis_client.ttl.return_value = -1
+        with patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis_client,
+        ), patch.object(pump_module, "_release_lock_script", release_script), patch(
             "backend.db_periodic_task.dispatch.pump.tick_id", side_effect=[50, 55]
         ):
             pump_module.pause_queue_pump("default", seconds=None)
@@ -923,11 +1005,14 @@ class TestQueueAdmission:
         assert statuses == [EnqueueStatus.ACCEPTED]
         keys = script.call_args.kwargs["keys"]
         args = script.call_args.kwargs["args"]
-        assert keys[2:4] == ["dispatch:metrics:task:task:0", "dispatch:metrics:queue:default:0"]
+        assert keys[2:4] == [
+            "dispatch:default:metrics:task:task:0",
+            "dispatch:default:metrics:queue:0",
+        ]
         assert keys[4] == "dispatch:default:task_members"
         assert args[2:4] == ["m:2:", "t:12:"]
         assert args[5] == "task"
-        assert args[6] == TASK_MEMBERS_TTL_SECONDS
+        assert args[6] == TASK_MEMBERS_CACHE_TTL_SECONDS
 
     def test_future_execute_at_delays_start_of_queue_wait_ttl(self):
         from backend.db_periodic_task.dispatch.admission import EnqueueStatus
@@ -973,7 +1058,8 @@ class TestQueueAdmission:
 
         assert statuses == expected
         script.assert_called_once()
-        assert len(script.call_args.kwargs["keys"]) == 5 + 2 * len(jobs)
+        # 6 base keys: pending, inflight, task_metrics, queue_metrics, task_members, producer_lock
+        assert len(script.call_args.kwargs["keys"]) == 6 + 2 * len(jobs)
         assert script.call_args.kwargs["args"][7] == len(jobs)
 
     def test_batch_admission_rejects_more_than_25_jobs(self):
@@ -1006,13 +1092,13 @@ class TestQueueCleanup:
 
         script.assert_called_once()
         assert script.call_args.kwargs["keys"] == [
-            "dispatch:job:task:item",
+            "dispatch:default:job:task:item",
             "dispatch:default:inflight",
-            "dispatch:dedupe:default:task:item",
+            "dispatch:default:dedupe:task:item",
             "dispatch:default:task_members",
         ]
         assert script.call_args.kwargs["args"][0:2] == ["task:item", "inflight:task"]
-        assert script.call_args.kwargs["args"][2] == TASK_MEMBERS_TTL_SECONDS
+        assert script.call_args.kwargs["args"][2] == TASK_MEMBERS_CACHE_TTL_SECONDS
 
     def test_requeue_uses_one_atomic_lifecycle_script(self):
         job = TestPumpQueue._job()
@@ -1030,13 +1116,13 @@ class TestQueueCleanup:
 
         script.assert_called_once()
         assert script.call_args.kwargs["keys"] == [
-            "dispatch:job:task:item",
+            "dispatch:default:job:task:item",
             "dispatch:default:inflight",
             "dispatch:default:pending",
             "dispatch:default:task_members",
         ]
         assert script.call_args.kwargs["args"][4:6] == ["inflight:task", "pending:task"]
-        assert script.call_args.kwargs["args"][6] == TASK_MEMBERS_TTL_SECONDS
+        assert script.call_args.kwargs["args"][6] == TASK_MEMBERS_CACHE_TTL_SECONDS
 
     def test_requeue_after_reservation_starts_fresh_wait_stint(self):
         """Reservation persists jobs with a cleared deadline; requeue grants a fresh wait budget."""
@@ -1114,7 +1200,7 @@ class TestQueueCleanup:
         assert queue_cls.inflight_key() == "dispatch:gone:inflight"
         assert queue_cls.pending_key() == "dispatch:gone:pending"
         assert queue_cls.task_members_key() == "dispatch:gone:task_members"
-        assert queue_cls.dedupe_key("task", "item") == "dispatch:dedupe:gone:task:item"
+        assert queue_cls.dedupe_key("task", "item") == "dispatch:gone:dedupe:task:item"
         assert DISPATCH_QUEUE_REGISTRY.get("gone") is None
 
         # Empty namespace still resolves to the default namespace keys.
@@ -1131,7 +1217,10 @@ class TestQueueCleanup:
         ]
         redis.mget.return_value = [b"payload"] * 100
 
-        with patch("backend.db_periodic_task.dispatch.reaper.RedisConn", redis):
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=redis), patch(
+            "backend.db_periodic_task.dispatch.routing.global_conn",
+            return_value=redis,
+        ):
             assert OrphanReaper.reap_orphaned_queue_members(DispatchQueue) == 0
 
         assert redis.zscan.call_args_list == [
@@ -1164,9 +1253,10 @@ class TestQueueCleanup:
         ]
         redis.mget.return_value = [None]  # the deep member's payload is gone
 
-        with patch("backend.db_periodic_task.dispatch.reaper.RedisConn", redis), patch.object(
-            OrphanReaper, "discard_orphaned_job", return_value=True
-        ) as discard:
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=redis), patch(
+            "backend.db_periodic_task.dispatch.routing.global_conn",
+            return_value=redis,
+        ), patch.object(OrphanReaper, "discard_orphaned_job", return_value=True) as discard:
             assert OrphanReaper.reap_orphaned_queue_members(DispatchQueue) == 1
 
         # The next tick continues from the stored cursor instead of the head.
@@ -1187,9 +1277,10 @@ class TestQueueCleanup:
         ]
         redis.mget.return_value = [b"payload"] * 100
 
-        with patch("backend.db_periodic_task.dispatch.reaper.RedisConn", redis), patch(
-            "backend.db_periodic_task.dispatch.reaper.time.monotonic", side_effect=[5.0, 6.0]
-        ):
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=redis), patch(
+            "backend.db_periodic_task.dispatch.routing.global_conn",
+            return_value=redis,
+        ), patch("backend.db_periodic_task.dispatch.reaper.time.monotonic", side_effect=[5.0, 6.0]):
             assert OrphanReaper.reap_orphaned_queue_members(DispatchQueue, deadline_at=5.5) == 0
 
         # Budget exhausted: the cursor from the last page is kept for the next tick.
@@ -1248,22 +1339,26 @@ class TestRateLimitRequeue:
         with patch("backend.db_periodic_task.dispatch.reaper._purge_member_script", script):
             assert OrphanReaper.purge_member(DispatchQueue, "task:item", task_key="task") == (1, 0)
 
-        script.assert_called_once_with(
-            keys=[
-                "dispatch:default:pending",
-                "dispatch:default:inflight",
-                "dispatch:default:task_members",
-            ],
-            args=["task:item", "pending:task", "inflight:task", TASK_MEMBERS_TTL_SECONDS],
-        )
+        script.assert_called_once()
+        assert script.call_args.kwargs["keys"] == [
+            "dispatch:default:pending",
+            "dispatch:default:inflight",
+            "dispatch:default:task_members",
+        ]
+        assert script.call_args.kwargs["args"] == [
+            "task:item",
+            "pending:task",
+            "inflight:task",
+            TASK_MEMBERS_CACHE_TTL_SECONDS,
+        ]
+        assert script.call_args.kwargs["client"] is not None
 
     def test_pending_count_for_task_reads_hash(self):
-        with patch(
-            "backend.db_periodic_task.dispatch.queue.RedisConn.hget",
-            return_value=b"3",
-        ) as hget:
+        client = MagicMock()
+        client.hget.return_value = b"3"
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=client) as conn:
             assert DispatchQueue.pending_count_for_task("task") == 3
-        hget.assert_called_once_with("dispatch:default:task_members", "pending:task")
+        conn.return_value.hget.assert_called_once_with("dispatch:default:task_members", "pending:task")
 
     @pytest.mark.parametrize(
         "method,count,expected",
@@ -1290,9 +1385,12 @@ class TestRateLimitRequeue:
             (0, [(b"task:a", 3.0)]),
         ]
         replace_script = MagicMock(return_value=1)
-        with patch("backend.db_periodic_task.dispatch.task_members.RedisConn.hkeys", return_value=[b"task"],), patch(
-            "backend.db_periodic_task.dispatch.task_members.RedisConn.zscan",
-            side_effect=[*zscan_pages, *inflight_pages],
+        redis = MagicMock()
+        redis.hkeys.return_value = [b"task"]
+        redis.zscan.side_effect = [*zscan_pages, *inflight_pages]
+        with patch("backend.db_periodic_task.dispatch.routing.global_conn", return_value=redis), patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis,
         ), patch(
             "backend.db_periodic_task.dispatch.task_members._replace_task_members_script",
             replace_script,
@@ -1311,7 +1409,7 @@ class TestRateLimitRequeue:
             2,
             1,
             2,
-            TASK_MEMBERS_TTL_SECONDS,
+            TASK_MEMBERS_CACHE_TTL_SECONDS,
             "pending:task",
             2,
             "inflight:task",
@@ -1319,7 +1417,9 @@ class TestRateLimitRequeue:
         ]
 
     def test_rebuild_task_member_counts_aborts_on_deadline_without_write(self):
-        with patch("backend.db_periodic_task.dispatch.task_members.RedisConn.hkeys", return_value=[b"task"]), patch(
+        redis = MagicMock()
+        redis.hkeys.return_value = [b"task"]
+        with patch("backend.db_periodic_task.dispatch.routing.global_conn", return_value=redis), patch(
             "backend.db_periodic_task.dispatch.task_members.time.monotonic",
             return_value=100.0,
         ), patch.object(TaskMembers, "_replace_if_current") as replace:
@@ -1328,12 +1428,15 @@ class TestRateLimitRequeue:
 
     def test_rebuild_task_member_counts_discards_changed_queue(self):
         replace_script = MagicMock(return_value=0)
-        with patch("backend.db_periodic_task.dispatch.task_members.RedisConn.hkeys", return_value=[b"task"]), patch(
-            "backend.db_periodic_task.dispatch.task_members.RedisConn.zscan",
-            side_effect=[
-                (0, [(b"task:a", 1.0)]),
-                (0, []),
-            ],
+        redis = MagicMock()
+        redis.hkeys.return_value = [b"task"]
+        redis.zscan.side_effect = [
+            (0, [(b"task:a", 1.0)]),
+            (0, []),
+        ]
+        with patch("backend.db_periodic_task.dispatch.routing.global_conn", return_value=redis), patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis,
         ), patch(
             "backend.db_periodic_task.dispatch.task_members._replace_task_members_script",
             replace_script,
@@ -1345,12 +1448,15 @@ class TestRateLimitRequeue:
     def test_rebuild_buckets_unresolved_members_instead_of_aborting(self):
         """P2-10: members with no registered task prefix must not stall the whole rebuild."""
         replace_script = MagicMock(return_value=1)
-        with patch("backend.db_periodic_task.dispatch.task_members.RedisConn.hkeys", return_value=[b"task"]), patch(
-            "backend.db_periodic_task.dispatch.task_members.RedisConn.zscan",
-            side_effect=[
-                (0, [(b"task:a", 1.0), (b"ghost-task:x", 2.0)]),  # pending: 1 known + 1 unresolved
-                (0, [(b"ghost-task:y", 3.0)]),  # inflight: 1 unresolved
-            ],
+        redis = MagicMock()
+        redis.hkeys.return_value = [b"task"]
+        redis.zscan.side_effect = [
+            (0, [(b"task:a", 1.0), (b"ghost-task:x", 2.0)]),  # pending: 1 known + 1 unresolved
+            (0, [(b"ghost-task:y", 3.0)]),  # inflight: 1 unresolved
+        ]
+        with patch("backend.db_periodic_task.dispatch.routing.global_conn", return_value=redis), patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=redis,
         ), patch(
             "backend.db_periodic_task.dispatch.task_members._replace_task_members_script",
             replace_script,
@@ -1371,16 +1477,15 @@ class TestRateLimitRequeue:
         assert resolve_task_key_from_job_id("task:item", registered) == "task"
 
     def test_task_members_daily_and_requested_markers(self):
-        with patch(
-            "backend.db_periodic_task.dispatch.task_members.RedisConn.exists",
-            side_effect=[0, 1],
-        ):
+        client = MagicMock()
+        client.exists.side_effect = [0, 1]
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=client):
             assert TaskMembers.hard_rebuild_due(DispatchQueue) is True
             assert TaskMembers.rebuild_requested(DispatchQueue) is True
 
-        with patch("backend.db_periodic_task.dispatch.task_members.RedisConn.set") as redis_set:
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=client) as conn:
             assert TaskMembers.request_rebuild(DispatchQueue, "count_drift") is True
-        redis_set.assert_called_once_with(
+        conn.return_value.set.assert_called_once_with(
             "dispatch:default:task_members_rebuild_requested",
             "count_drift",
             ex=TASK_MEMBERS_REBUILD_REQUEST_TTL_SECONDS,
@@ -1392,17 +1497,18 @@ class TestRateLimitRequeue:
             return_value=True,
         ) as marker:
             assert TaskMembers.try_start_rebuild(DispatchQueue) is True
-        marker.assert_called_once_with(
+        marker.assert_called_once()
+        assert marker.call_args.args == (
             "dispatch:default:task_members_rebuild_attempt",
             TASK_MEMBERS_REBUILD_RETRY_SECONDS,
-            nx=True,
         )
+        assert marker.call_args.kwargs["nx"] is True
+        assert marker.call_args.kwargs["client"] is not None
 
         pipeline = MagicMock()
-        with patch(
-            "backend.db_periodic_task.dispatch.task_members.RedisConn.pipeline",
-            return_value=pipeline,
-        ):
+        client = MagicMock()
+        client.pipeline.return_value = pipeline
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=client):
             assert TaskMembers.mark_rebuilt(DispatchQueue) is True
         pipeline.set.assert_called_once_with(
             "dispatch:default:task_members_rebuilt",
@@ -1428,11 +1534,13 @@ class TestRateLimitRequeue:
         ],
     )
     def test_task_members_counts_drifted(self, pending_z, inflight_z, members, expected):
+        client = MagicMock()
+        client.hgetall.return_value = members
         with patch.object(DispatchQueue, "pending_count", return_value=pending_z), patch.object(
             DispatchQueue, "inflight_count", return_value=inflight_z
         ), patch(
-            "backend.db_periodic_task.dispatch.task_members.RedisConn.hgetall",
-            return_value=members,
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=client,
         ):
             assert TaskMembers.counts_drifted(DispatchQueue) is expected
 
@@ -1440,11 +1548,13 @@ class TestRateLimitRequeue:
         job = TestPumpQueue._job(namespace="default")
         pipeline = MagicMock()
         pipeline.execute.return_value = [1, 1]
+        client = MagicMock()
+        client.pipeline.return_value = pipeline
         with patch.object(DispatchQueue, "get_job", return_value=job), patch.object(
             DispatchQueue, "queue_for_namespace", return_value=DispatchQueue
         ), patch.object(OrphanReaper, "purge_member", return_value=(0, 1)) as purge, patch(
-            "backend.db_periodic_task.dispatch.reaper.RedisConn.pipeline",
-            return_value=pipeline,
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=client,
         ), patch.object(
             DispatchQueue, "record_outcome"
         ) as record_outcome:
@@ -1457,8 +1567,8 @@ class TestRateLimitRequeue:
             )
 
         purge.assert_called_once_with(DispatchQueue, job.job_id, task_key=job.task_key)
-        pipeline.delete.assert_any_call("dispatch:job:task:item")
-        pipeline.delete.assert_any_call("dispatch:dedupe:default:task:item")
+        pipeline.delete.assert_any_call("dispatch:default:job:task:item")
+        pipeline.delete.assert_any_call("dispatch:default:dedupe:task:item")
         record_outcome.assert_called_once()
         assert record_outcome.call_args.args[1].value == "expired"
 
@@ -1469,6 +1579,8 @@ class TestRateLimitRequeue:
         hit_queue._ns.return_value = "ai"
         miss_queue = MagicMock()
         miss_queue._ns.return_value = "dummy"
+        client = MagicMock()
+        client.pipeline.return_value = pipeline
         with patch.object(DispatchQueue, "get_job", return_value=None), patch.object(
             DispatchQueue, "iter_queues", return_value=[miss_queue, hit_queue]
         ), patch.object(
@@ -1476,8 +1588,8 @@ class TestRateLimitRequeue:
             "purge_member",
             side_effect=lambda queue_cls, job_id, **_kwargs: (1, 0) if queue_cls is hit_queue else (0, 0),
         ), patch(
-            "backend.db_periodic_task.dispatch.reaper.RedisConn.pipeline",
-            return_value=pipeline,
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=client,
         ), patch.object(
             DispatchQueue, "record_outcome"
         ):
@@ -1491,21 +1603,19 @@ class TestRateLimitRequeue:
                 is True
             )
 
-        dedupe_deletes = [
-            c.args[0] for c in pipeline.delete.call_args_list if c.args[0].startswith("dispatch:dedupe:")
-        ]
+        dedupe_deletes = [c.args[0] for c in pipeline.delete.call_args_list if ":dedupe:" in c.args[0]]
         # No cross-namespace broadcast: only the queue where the member lived.
-        assert dedupe_deletes == ["dispatch:dedupe:ai:task:item"]
+        assert dedupe_deletes == ["dispatch:ai:dedupe:task:item"]
+        pipeline.delete.assert_any_call("dispatch:ai:job:task:item")
 
     def test_discard_orphaned_job_unknown_namespace_without_hit_keeps_dedupe(self):
-        pipeline = MagicMock()
-        pipeline.execute.return_value = [0]  # payload already gone
         miss_queue = MagicMock()
+        client = MagicMock()
         with patch.object(DispatchQueue, "get_job", return_value=None), patch.object(
             DispatchQueue, "iter_queues", return_value=[miss_queue]
         ), patch.object(OrphanReaper, "purge_member", return_value=(0, 0)), patch(
-            "backend.db_periodic_task.dispatch.reaper.RedisConn.pipeline",
-            return_value=pipeline,
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=client,
         ):
             assert (
                 OrphanReaper.discard_orphaned_job(
@@ -1517,15 +1627,17 @@ class TestRateLimitRequeue:
                 is True
             )
 
-        dedupe_deletes = [c for c in pipeline.delete.call_args_list if c.args[0].startswith("dispatch:dedupe:")]
-        assert dedupe_deletes == []
+        client.pipeline.assert_not_called()
 
     def test_discard_orphaned_job_unregistered_namespace_uses_ephemeral_queue(self):
         job = TestPumpQueue._job(namespace="ghost")
         ephemeral = MagicMock()
         ephemeral._ns.return_value = "ghost"
+        ephemeral._job_key.return_value = "dispatch:ghost:job:task:item"
         pipeline = MagicMock()
         pipeline.execute.return_value = [1, 1]
+        client = MagicMock()
+        client.pipeline.return_value = pipeline
         with patch.object(DispatchQueue, "get_job", return_value=job), patch.object(
             DispatchQueue, "queue_for_namespace", return_value=None
         ), patch.object(
@@ -1535,8 +1647,8 @@ class TestRateLimitRequeue:
         ) as iter_queues, patch.object(
             OrphanReaper, "purge_member", return_value=(0, 1)
         ) as purge, patch(
-            "backend.db_periodic_task.dispatch.reaper.RedisConn.pipeline",
-            return_value=pipeline,
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=client,
         ), patch.object(
             DispatchQueue, "record_outcome"
         ):
@@ -1554,7 +1666,8 @@ class TestRateLimitRequeue:
         make_ephemeral.assert_called_once_with("ghost")
         iter_queues.assert_not_called()  # no broadcast when the namespace is known
         purge.assert_called_once_with(ephemeral, job.job_id, task_key=job.task_key)
-        pipeline.delete.assert_any_call("dispatch:dedupe:ghost:task:item")
+        pipeline.delete.assert_any_call("dispatch:ghost:job:task:item")
+        pipeline.delete.assert_any_call("dispatch:ghost:dedupe:task:item")
 
     def test_reconcile_registered_metadata_drops_unknown_task_and_queue(self):
         from backend.db_periodic_task.dispatch.registry import DISPATCH_REGISTRY
@@ -1574,10 +1687,12 @@ class TestRateLimitRequeue:
         DISPATCH_REGISTRY["alive.task"] = alive
         DISPATCH_REGISTRY["bad.queue"] = alive
         try:
-            with patch("backend.db_periodic_task.dispatch.queue.RedisConn.hgetall", return_value=raw,), patch(
-                "backend.db_periodic_task.dispatch.queue.RedisConn.hdel",
-                return_value=2,
-            ) as hdel, patch.object(DispatchQueue, "ensure_queues_loaded"), patch.dict(
+            client = MagicMock()
+            client.hgetall.return_value = raw
+            client.hdel.return_value = 2
+            with patch("backend.db_periodic_task.dispatch.routing.global_conn", return_value=client), patch.object(
+                DispatchQueue, "ensure_queues_loaded"
+            ), patch.dict(
                 "backend.db_periodic_task.dispatch.queue.DISPATCH_QUEUE_REGISTRY",
                 {"alive": MagicMock()},
                 clear=True,
@@ -1589,15 +1704,16 @@ class TestRateLimitRequeue:
             DISPATCH_REGISTRY.update(previous)
 
         assert removed == 2
-        removed_fields = set(hdel.call_args.args[1:])
+        removed_fields = set(client.hdel.call_args.args[1:])
         assert removed_fields == {"gone.task", "bad.queue"}
 
     def test_register_task_metadata_triggers_reconcile(self):
-        with patch("backend.db_periodic_task.dispatch.queue.RedisConn.hset") as hset, patch.object(
+        client = MagicMock()
+        with patch("backend.db_periodic_task.dispatch.routing.global_conn", return_value=client) as conn, patch.object(
             DispatchQueue, "reconcile_registered_metadata"
         ) as reconcile:
             DispatchQueue.register_task_metadata("task", {"task_key": "task", "namespace": "ai"})
-        hset.assert_called_once()
+        conn.return_value.hset.assert_called_once()
         reconcile.assert_called_once()
 
     def test_resolve_inflight_ttl_uses_execution_timeout_plus_margin(self):
@@ -1607,10 +1723,12 @@ class TestRateLimitRequeue:
         assert cfg.resolve_inflight_ttl_seconds() == 3600 + INFLIGHT_TTL_MARGIN_SECONDS
 
     def test_task_counts_uses_one_hmget(self):
-        with patch("backend.db_periodic_task.dispatch.queue.RedisConn.hmget", return_value=[b"7", b"2"]) as hmget:
+        client = MagicMock()
+        client.hmget.return_value = [b"7", b"2"]
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=client) as conn:
             assert DispatchQueue.task_counts("task") == (7, 2)
 
-        hmget.assert_called_once_with(
+        conn.return_value.hmget.assert_called_once_with(
             DispatchQueue.task_members_key(),
             ["pending:task", "inflight:task"],
         )

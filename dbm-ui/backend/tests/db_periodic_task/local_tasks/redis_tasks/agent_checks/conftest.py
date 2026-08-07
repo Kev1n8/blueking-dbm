@@ -17,6 +17,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from backend.db_periodic_task.dispatch.config import (
+    DEFAULT_MAX_RATE_LIMIT_RETRIES,
+    DISPATCH_RATE_LIMIT_COOLDOWN_SECONDS,
+)
+
 
 @pytest.fixture(scope="module")
 def base(django_db_setup, django_db_blocker):
@@ -42,8 +47,8 @@ def make_config(base):
         defaults = dict(
             lookback_days=14,
             ignore_cluster_domains=[],
-            rate_limit_cooldown_seconds=60,
-            max_rate_limit_retries=3,
+            rate_limit_cooldown_seconds=DISPATCH_RATE_LIMIT_COOLDOWN_SECONDS,
+            max_rate_limit_retries=DEFAULT_MAX_RATE_LIMIT_RETRIES,
             agent_invoke_timeout_seconds=540,
             enabled=True,
         )

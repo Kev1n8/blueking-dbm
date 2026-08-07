@@ -17,18 +17,24 @@ from backend.db_periodic_task.dispatch.observability import DispatchStats, Queue
 class TestDispatchMetrics:
     def test_queue_counter_uses_tick_field_and_retention(self):
         script = MagicMock()
-        with patch.object(DispatchMetrics, "_get_counter_script", return_value=script):
+        with patch.object(DispatchMetrics, "_get_counter_script", return_value=script), patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=MagicMock(),
+        ):
             DispatchMetrics.record_queue_counter("ai", "dispatched", 3, timestamp=120.0)
 
-        assert script.call_args.kwargs["keys"] == ["dispatch:metrics:queue:ai:0"]
+        assert script.call_args.kwargs["keys"] == ["dispatch:ai:metrics:queue:0"]
         assert script.call_args.kwargs["args"] == ["t:12:dispatched", 3, METRICS_RETENTION_SECONDS]
 
     def test_reservoir_is_hourly_and_bounded(self):
         script = MagicMock()
-        with patch.object(DispatchMetrics, "_get_reservoir_script", return_value=script):
+        with patch.object(DispatchMetrics, "_get_reservoir_script", return_value=script), patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=MagicMock(),
+        ):
             DispatchMetrics.record_sample("ai", "execution_seconds", 1.25, timestamp=3601.0)
 
-        assert script.call_args.kwargs["keys"] == ["dispatch:metrics:sample:ai:1"]
+        assert script.call_args.kwargs["keys"] == ["dispatch:ai:metrics:sample:1"]
         assert script.call_args.kwargs["args"][0:3] == ["execution_seconds", "3601.0:1.25", RESERVOIR_SIZE]
 
     def test_distribution_sampling_is_stable_and_not_universal(self):
@@ -60,10 +66,9 @@ class TestDispatchMetrics:
             DispatchMetrics,
             "should_sample",
             side_effect=lambda identity: identity.startswith("keep"),
-        ), patch.object(
-            DispatchMetrics,
-            "_get_reservoir_batch_script",
-            return_value=script,
+        ), patch.object(DispatchMetrics, "_get_reservoir_batch_script", return_value=script,), patch(
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
+            return_value=MagicMock(),
         ):
             DispatchMetrics.record_samples(
                 "ai",
@@ -84,8 +89,11 @@ class TestDispatchMetrics:
             "m:1:outcome:error": "1",
             "m:59:outcome:success": "9",
         }
-        with patch("backend.db_periodic_task.dispatch.metrics.RedisConn.hgetall", return_value=raw):
+        client = MagicMock()
+        client.hgetall.return_value = raw
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=client):
             counters = DispatchMetrics.aggregate_task_counters(
+                "ai",
                 "task",
                 start_at=0,
                 end_at=120,
@@ -99,7 +107,9 @@ class TestDispatchMetrics:
             "r:execution_seconds:s:1": "10.0:1.0",
             "r:execution_seconds:s:2": "1000.0:9.0",
         }
-        with patch("backend.db_periodic_task.dispatch.metrics.RedisConn.hgetall", return_value=raw):
+        client = MagicMock()
+        client.hgetall.return_value = raw
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=client):
             summary = DispatchMetrics.distribution(
                 "ai",
                 "execution_seconds",
@@ -132,7 +142,9 @@ class TestDispatchMetrics:
             }
             return [data.get(field) for field in fields]
 
-        with patch("backend.db_periodic_task.dispatch.metrics.RedisConn.hmget", side_effect=hmget) as mocked:
+        client = MagicMock()
+        client.hmget.side_effect = hmget
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=client) as mocked:
             # tick_id 12 → timestamp 120 → slot 12
             counts = DispatchMetrics.queue_tick_counts(
                 "ai",
@@ -141,7 +153,7 @@ class TestDispatchMetrics:
             )
 
         assert counts == {"candidates": 15, "dispatched": 5, "blocked": 1}
-        assert mocked.call_args.args[1] == [
+        assert mocked.return_value.hmget.call_args.args[1] == [
             "t:12:candidates",
             "t:12:dispatched",
             "t:12:blocked",
@@ -159,12 +171,13 @@ class TestPumpController:
 
     @staticmethod
     def _decide(queue, settings, *, state, previous, tick_id=123):
-        with patch(
-            "backend.db_periodic_task.dispatch.controller.RedisConn.hgetall",
-            return_value=state,
-        ), patch.object(DispatchMetrics, "queue_tick_counts", return_value=previous,), patch.object(
-            PumpController, "_persist"
-        ):
+        client = MagicMock()
+        client.hgetall.return_value = state
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=client,), patch.object(
+            DispatchMetrics,
+            "queue_tick_counts",
+            return_value=previous,
+        ), patch.object(PumpController, "_persist"):
             return PumpController.decide(queue, settings, current_tick_id=tick_id)
 
     def test_cold_start_uses_ten_percent_of_configured_concurrency(self):
@@ -287,7 +300,7 @@ class TestPumpController:
         queue = self._queue(inflight=0)
         settings = DispatchQueueConfig(max_inflight=200)
         with patch(
-            "backend.db_periodic_task.dispatch.controller.RedisConn.hgetall",
+            "backend.db_periodic_task.dispatch.routing.conn_for_namespace",
             side_effect=RuntimeError("redis down"),
         ), patch.object(PumpController, "_persist"):
             decision = PumpController.decide(queue, settings, current_tick_id=123)
@@ -299,6 +312,8 @@ class TestPumpController:
 
     def test_controller_state_serializes_booleans_and_reads_typed_values(self):
         pipeline = MagicMock()
+        client = MagicMock()
+        client.pipeline.return_value = pipeline
         decision = PumpControlDecision(
             namespace="ai",
             tick_id=123,
@@ -313,10 +328,7 @@ class TestPumpController:
             cold_start=True,
             partial=False,
         )
-        with patch(
-            "backend.db_periodic_task.dispatch.controller.RedisConn.pipeline",
-            return_value=pipeline,
-        ):
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=client):
             PumpController._persist(decision)
 
         pipeline.hset.assert_called_once()
@@ -337,10 +349,9 @@ class TestPumpController:
             "partial": "0",
             "updated_at": "1710000000.5",
         }
-        with patch(
-            "backend.db_periodic_task.dispatch.controller.RedisConn.hgetall",
-            return_value=raw,
-        ):
+        read_client = MagicMock()
+        read_client.hgetall.return_value = raw
+        with patch("backend.db_periodic_task.dispatch.routing.conn_for_namespace", return_value=read_client):
             state = PumpController.read_state("ai")
 
         assert state["tick_id"] == 123

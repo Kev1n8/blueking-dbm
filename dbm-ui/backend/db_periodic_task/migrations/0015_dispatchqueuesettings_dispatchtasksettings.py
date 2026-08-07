@@ -54,4 +54,21 @@ class Migration(migrations.Migration):
                 "indexes": [models.Index(fields=["queue", "task_key"], name="idx_dispatch_queue_task")],
             },
         ),
+        migrations.CreateModel(
+            name="DispatchQueueRoute",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                ("creator", models.CharField(max_length=64, verbose_name="创建人")),
+                ("create_at", models.DateTimeField(auto_now_add=True, verbose_name="创建时间")),
+                ("updater", models.CharField(max_length=64, verbose_name="修改人")),
+                ("update_at", models.DateTimeField(auto_now=True, verbose_name="更新时间")),
+                ("namespace", models.CharField(max_length=128, unique=True, verbose_name="队列命名空间")),
+                ("redis_alias", models.CharField(max_length=64, verbose_name="Redis 实例别名")),
+            ],
+            options={
+                "verbose_name": "Dispatch队列路由",
+                "verbose_name_plural": "Dispatch队列路由",
+                "ordering": ["namespace"],
+            },
+        ),
     ]

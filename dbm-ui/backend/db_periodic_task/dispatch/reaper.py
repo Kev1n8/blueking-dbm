@@ -13,12 +13,17 @@ import logging
 import time
 from typing import Optional
 
+from backend.db_periodic_task.dispatch import routing
 from backend.db_periodic_task.dispatch.job import resolve_task_key_from_job_id, work_item_id_from_job_id
-from backend.db_periodic_task.dispatch.lua import register_script_once
+from backend.db_periodic_task.dispatch.lua import compile_script, eval_script
 from backend.db_periodic_task.dispatch.metrics import _text
 from backend.db_periodic_task.dispatch.outcomes import DispatchOutcomeType
-from backend.db_periodic_task.dispatch.queue import KEY_REGISTERED, TASK_MEMBERS_TTL_SECONDS, DispatchQueue
-from backend.utils.redis import RedisConn
+from backend.db_periodic_task.dispatch.queue import (
+    KEY_JOB_PREFIX,
+    KEY_REGISTERED,
+    TASK_MEMBERS_CACHE_TTL_SECONDS,
+    DispatchQueue,
+)
 
 logger = logging.getLogger("root")
 
@@ -51,12 +56,12 @@ if pending_removed > 0 or inflight_removed > 0 then
 end
 return {pending_removed, inflight_removed}
 """
-_purge_member_script = register_script_once(PURGE_MEMBER_LUA)
+_purge_member_script = compile_script(PURGE_MEMBER_LUA)
 
 
 def _registered_task_keys() -> list[str]:
     try:
-        return [_text(key) for key in (RedisConn.hkeys(KEY_REGISTERED) or [])]
+        return [_text(key) for key in (routing.global_conn().hkeys(KEY_REGISTERED) or [])]
     except Exception:
         return []
 
@@ -74,25 +79,29 @@ class OrphanReaper:
         return f"{zset_key}:reap_cursor"
 
     @classmethod
-    def _read_reap_cursor(cls, zset_key: str) -> int:
+    def _read_reap_cursor(cls, queue_cls: type[DispatchQueue], zset_key: str) -> int:
         """Return the persisted ZSCAN cursor for ``zset_key`` (0 = start from head)."""
         try:
-            raw = RedisConn.get(cls._reap_cursor_key(zset_key))
+            raw = queue_cls.conn().get(cls._reap_cursor_key(zset_key))
             return int(raw) if raw is not None else 0
         except Exception:
             return 0
 
     @classmethod
-    def _write_reap_cursor(cls, zset_key: str, cursor: int) -> None:
+    def _write_reap_cursor(cls, queue_cls: type[DispatchQueue], zset_key: str, cursor: int) -> None:
         try:
-            RedisConn.set(cls._reap_cursor_key(zset_key), str(max(0, int(cursor))), ex=REAP_CURSOR_TTL_SECONDS)
+            queue_cls.conn().set(
+                cls._reap_cursor_key(zset_key),
+                str(max(0, int(cursor))),
+                ex=REAP_CURSOR_TTL_SECONDS,
+            )
         except Exception as exc:
             logger.warning("dispatch: reap cursor write failed key=%s: %s", zset_key, exc)
 
     @classmethod
-    def _clear_reap_cursor(cls, zset_key: str) -> None:
+    def _clear_reap_cursor(cls, queue_cls: type[DispatchQueue], zset_key: str) -> None:
         try:
-            RedisConn.delete(cls._reap_cursor_key(zset_key))
+            queue_cls.conn().delete(cls._reap_cursor_key(zset_key))
         except Exception as exc:
             logger.warning("dispatch: reap cursor clear failed key=%s: %s", zset_key, exc)
 
@@ -105,13 +114,15 @@ class OrphanReaper:
 
         Returns ``(pending_removed, inflight_removed)`` so callers can skip no-op work.
         """
-        pending_removed, inflight_removed = _purge_member_script(
+        pending_removed, inflight_removed = eval_script(
+            _purge_member_script,
+            client=queue_cls.conn(),
             keys=[queue_cls.pending_key(), queue_cls.inflight_key(), queue_cls.task_members_key()],
             args=[
                 job_id,
                 queue_cls._pending_member_field(task_key) if task_key else "",
                 queue_cls._inflight_member_field(task_key) if task_key else "",
-                TASK_MEMBERS_TTL_SECONDS,
+                TASK_MEMBERS_CACHE_TTL_SECONDS,
             ],
         )
         return int(pending_removed or 0), int(inflight_removed or 0)
@@ -181,13 +192,28 @@ class OrphanReaper:
                     inflight_removed += inflight_hit
                     if pending_hit > 0 or inflight_hit > 0:
                         dedupe_namespaces.add(candidate_queue._ns())
-            pipe = RedisConn.pipeline(transaction=False)
-            pipe.delete(queue_cls._job_key(job_id))
-            if resolved_task_key and resolved_work_item_id:
+            # Job payloads and dedupe keys are namespace-bound, so the
+            # trailing cleanup is one pipeline per shard, grouped by the
+            # namespaces actually hit. Never broadcast across all namespaces.
+            delete_keys_by_ns: dict[str, list[str]] = {}
+            if target_queue is not None:
+                delete_keys_by_ns.setdefault(target_queue._ns(), []).append(target_queue._job_key(job_id))
+            else:
                 for ns in dedupe_namespaces:
-                    pipe.delete(queue_cls.dedupe_key_for_namespace(ns, resolved_task_key, resolved_work_item_id))
-            results = pipe.execute()
-            job_deleted = int(results[0] or 0) > 0
+                    delete_keys_by_ns.setdefault(ns, []).append(KEY_JOB_PREFIX.format(ns=ns) + job_id)
+            if resolved_task_key and resolved_work_item_id:
+                for ns in delete_keys_by_ns:
+                    delete_keys_by_ns[ns].append(
+                        DispatchQueue.dedupe_key_for_namespace(ns, resolved_task_key, resolved_work_item_id)
+                    )
+            job_deleted = False
+            for ns, keys in delete_keys_by_ns.items():
+                pipe = routing.conn_for_namespace(ns).pipeline(transaction=False)
+                for key in keys:
+                    pipe.delete(key)
+                results = pipe.execute()
+                if results and int(results[0] or 0) > 0:
+                    job_deleted = True
             touched = pending_removed > 0 or inflight_removed > 0 or job_deleted
             if resolved_task_key and touched:
                 outcome_queue = target_queue or queue_cls
@@ -225,17 +251,19 @@ class OrphanReaper:
         registered = _registered_task_keys()
 
         for key in (queue_cls.pending_key(), queue_cls.inflight_key()):
-            cursor = cls._read_reap_cursor(key)
+            cursor = cls._read_reap_cursor(queue_cls, key)
             scanned = 0
             try:
                 while scanned < scan_limit:
                     if deadline_at is not None and time.monotonic() >= deadline_at:
-                        cls._write_reap_cursor(key, cursor)
+                        cls._write_reap_cursor(queue_cls, key, cursor)
                         return reaped
-                    cursor, members = RedisConn.zscan(key, cursor, count=100)
+                    cursor, members = queue_cls.conn().zscan(key, cursor, count=100)
                     job_ids = [_text(job_id) for job_id, _score in members[: max(0, scan_limit - scanned)]]
                     scanned += len(job_ids)
-                    payloads = RedisConn.mget([queue_cls._job_key(job_id) for job_id in job_ids]) if job_ids else []
+                    payloads = (
+                        queue_cls.conn().mget([queue_cls._job_key(job_id) for job_id in job_ids]) if job_ids else []
+                    )
                     orphan_ids = [job_id for job_id, payload in zip(job_ids, payloads) if not payload]
                     for job_id in orphan_ids:
                         task_key = resolve_task_key_from_job_id(job_id, registered)
@@ -249,12 +277,12 @@ class OrphanReaper:
                         ):
                             reaped += 1
                     if cursor == 0:
-                        cls._clear_reap_cursor(key)
+                        cls._clear_reap_cursor(queue_cls, key)
                         break
                 else:
                     # scan_limit reached mid-iteration: save the cursor so the
                     # next call resumes here instead of rescanning the head.
-                    cls._write_reap_cursor(key, cursor)
+                    cls._write_reap_cursor(queue_cls, key, cursor)
             except Exception as exc:
                 logger.warning("dispatch: reap_orphaned_queue_members failed key=%s: %s", key, exc)
         return reaped

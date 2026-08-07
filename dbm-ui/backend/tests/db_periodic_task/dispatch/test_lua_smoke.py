@@ -17,46 +17,90 @@ specific language governing permissions and limitations under the License.
 # counter moves, atomic purge decrements (A1), and namespace-scoped dedupe
 # cleanup on orphan discard (A2).
 #
+# Multi-shard coverage uses the same Redis process with isolated logical DBs
+# (CI: broker=/0, default+dispatch=/1, so this suite claims /11 and /12) to
+# exercise real ``get_redis_connection`` alias routing and drop-mode remap.
+# ``test_routing.py`` / ``test_rebalance.py`` stay mock-based for control flow.
+#
 # All keys live under smoke-specific namespaces and are deleted before and
 # after each test; nothing touches production-looking dispatch keys.
+import copy
 import json
 import time
+from unittest.mock import patch
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+from django.conf import settings
+from django.test import override_settings
+from django_redis import get_redis_connection
 
 from backend.db_periodic_task.dispatch import lifecycle
 from backend.db_periodic_task.dispatch.admission import EnqueueStatus, QueueAdmission
 from backend.db_periodic_task.dispatch.config import DispatchQueueConfig
 from backend.db_periodic_task.dispatch.job import DispatchJob, build_job_id
-from backend.db_periodic_task.dispatch.queue import DISPATCH_QUEUE_REGISTRY, TASK_MEMBERS_TTL_SECONDS, DispatchQueue
+from backend.db_periodic_task.dispatch.queue import (
+    DISPATCH_QUEUE_REGISTRY,
+    TASK_MEMBERS_CACHE_TTL_SECONDS,
+    DispatchQueue,
+)
 from backend.db_periodic_task.dispatch.reaper import OrphanReaper
 from backend.db_periodic_task.dispatch.reservation import QueueReservation, ReservationStatus
-from backend.utils.redis import RedisConn
 
 TASK_KEY = "smoke.task"
 NAMESPACE = "smoke"
 NAMESPACE_TWO = "smoke2"
+# Dedicated namespace for the multi-DB remap smoke so it never collides with
+# the single-shard ``live_redis`` keys even if a cleanup path fails.
+NAMESPACE_SHARD = "smokeshard"
 
-# Key patterns this suite may create; cleaned before/after every test.
+# Key patterns this suite may create; cleaned before/after every test. The
+# normalized layout puts every namespace key under ``dispatch:{ns}:*``.
 _KEY_PATTERNS = [
     f"dispatch:{NAMESPACE}:*",
     f"dispatch:{NAMESPACE_TWO}:*",
-    f"dispatch:job:{TASK_KEY}:*",
-    f"dispatch:dedupe:{NAMESPACE}:*",
-    f"dispatch:dedupe:{NAMESPACE_TWO}:*",
-    f"dispatch:metrics:queue:{NAMESPACE}:*",
-    f"dispatch:metrics:queue:{NAMESPACE_TWO}:*",
-    f"dispatch:metrics:task:{TASK_KEY}:*",
-    f"dispatch:metrics:sample:{NAMESPACE}:*",
-    f"dispatch:metrics:sample:{NAMESPACE_TWO}:*",
+    f"dispatch:{NAMESPACE_SHARD}:*",
 ]
+
+# Logical DBs reserved for multi-shard smoke (CI redis image defaults to 0-15).
+_SHARD_DB_0 = 11
+_SHARD_DB_1 = 12
+_SHARD_ALIASES = ["dispatch_0", "dispatch_1"]
+
+
+def _redis_url_with_db(url: str, db: int) -> str:
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, f"/{db}", parts.query, parts.fragment))
+
+
+def _redis_cache(location: str) -> dict:
+    """Mirror ``config.default._redis_cache`` so CACHES aliases stay consistent."""
+    return {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": location,
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            "REDIS_CLIENT_CLASS": "redis.client.StrictRedis",
+            "REDIS_CLIENT_KWARGS": {"decode_responses": True},
+            "SERIALIZER": "backend.utils.redis.JSONSerializer",
+            "MAX_ENTRIES": 100000,
+            "CULL_FREQUENCY": 10,
+        },
+    }
 
 
 def _delete_test_keys() -> None:
+    from backend.db_periodic_task.dispatch import routing
+
+    client = routing.conn_for_namespace(NAMESPACE)
     for pattern in _KEY_PATTERNS:
-        keys = list(RedisConn.scan_iter(match=pattern, count=500))
+        keys = list(client.scan_iter(match=pattern, count=500))
         if keys:
-            RedisConn.delete(*keys)
+            client.delete(*keys)
+
+
+def _ns_key_count(client, namespace: str) -> int:
+    return sum(1 for _ in client.scan_iter(match=f"dispatch:{namespace}:*", count=500))
 
 
 def _make_queue_class(namespace: str) -> type[DispatchQueue]:
@@ -64,11 +108,11 @@ def _make_queue_class(namespace: str) -> type[DispatchQueue]:
     return type(f"SmokeQueue:{namespace}", (DispatchQueue,), {"config_cls": config_cls})
 
 
-def _job(work_item_id: str, *, execute_at=None) -> DispatchJob:
+def _job(work_item_id: str, *, namespace: str = NAMESPACE, execute_at=None) -> DispatchJob:
     return DispatchJob(
         job_id=build_job_id(TASK_KEY, work_item_id),
         task_key=TASK_KEY,
-        namespace=NAMESPACE,
+        namespace=namespace,
         work_item_id=work_item_id,
         created_at=time.time(),
         execute_at=execute_at or time.time(),
@@ -97,18 +141,80 @@ def _reserve(queue_cls, jobs, *, max_inflight=2, tick_budget=10):
 
 
 @pytest.fixture
-def live_redis():
+def live_redis(django_db_blocker):
     """Real Redis with smoke-namespace cleanup and queue-registry isolation."""
-    from unittest.mock import patch
+    from backend.db_periodic_task.dispatch import routing
 
     saved_registry = dict(DISPATCH_QUEUE_REGISTRY)
     DISPATCH_QUEUE_REGISTRY.clear()
-    _delete_test_keys()
-    with patch.object(DispatchQueue, "ensure_queues_loaded"):
-        yield RedisConn
+    with django_db_blocker.unblock():
+        routing.reset_route_cache()
+        _delete_test_keys()
+        # Pre-assign route rows so every Redis op resolves without a DB hit.
+        for ns in (NAMESPACE, NAMESPACE_TWO):
+            routing.assign_route(ns)
+        with patch.object(DispatchQueue, "ensure_queues_loaded"):
+            yield routing.conn_for_namespace(NAMESPACE)
+        _delete_test_keys()
+        routing.reset_route_cache()
+        from backend.db_periodic_task.models import DispatchQueueRoute
+
+        DispatchQueueRoute.objects.filter(namespace__in=(NAMESPACE, NAMESPACE_TWO)).delete()
     DISPATCH_QUEUE_REGISTRY.clear()
     DISPATCH_QUEUE_REGISTRY.update(saved_registry)
-    _delete_test_keys()
+
+
+@pytest.fixture
+def multi_shard_redis(django_db_blocker):
+    """Two dispatch aliases backed by Redis logical DBs 11/12 on the CI host.
+
+    Exercises real ``get_redis_connection`` fan-out without needing a second
+    Redis container. Convergence sleeps are patched out by individual tests.
+    """
+    from backend.db_periodic_task.dispatch import routing
+    from backend.db_periodic_task.models import DispatchQueueRoute
+
+    base_url = settings.CACHES["default"]["LOCATION"]
+    caches = copy.deepcopy(settings.CACHES)
+    caches["dispatch_0"] = _redis_cache(_redis_url_with_db(base_url, _SHARD_DB_0))
+    caches["dispatch_1"] = _redis_cache(_redis_url_with_db(base_url, _SHARD_DB_1))
+
+    saved_registry = dict(DISPATCH_QUEUE_REGISTRY)
+    DISPATCH_QUEUE_REGISTRY.clear()
+    with override_settings(CACHES=caches, DISPATCH_REDIS_ALIASES=list(_SHARD_ALIASES)):
+        # Drop any cached django-redis clients so LOCATION overrides take effect.
+        from django.core.cache import caches as django_caches
+
+        django_caches.close_all()
+
+        shard0 = get_redis_connection("dispatch_0")
+        shard1 = get_redis_connection("dispatch_1")
+        shard0.flushdb()
+        shard1.flushdb()
+
+        with django_db_blocker.unblock():
+            routing.reset_route_cache()
+            DispatchQueueRoute.objects.filter(namespace=NAMESPACE_SHARD).delete()
+            DispatchQueueRoute.objects.create(
+                namespace=NAMESPACE_SHARD,
+                redis_alias="dispatch_0",
+                creator="tester",
+                updater="tester",
+            )
+            routing.reset_route_cache()
+            with patch.object(DispatchQueue, "ensure_queues_loaded"):
+                yield {
+                    "dispatch_0": shard0,
+                    "dispatch_1": shard1,
+                    "aliases": list(_SHARD_ALIASES),
+                }
+            shard0.flushdb()
+            shard1.flushdb()
+            routing.reset_route_cache()
+            DispatchQueueRoute.objects.filter(namespace=NAMESPACE_SHARD).delete()
+
+    DISPATCH_QUEUE_REGISTRY.clear()
+    DISPATCH_QUEUE_REGISTRY.update(saved_registry)
 
 
 class TestEnqueueLua:
@@ -130,6 +236,41 @@ class TestEnqueueLua:
         assert statuses == [EnqueueStatus.ACCEPTED, EnqueueStatus.ACCEPTED, EnqueueStatus.CAPACITY_REJECTED]
         assert live_redis.zcard(queue_cls.pending_key()) == 2
         assert live_redis.hget(queue_cls.task_members_key(), f"pending:{TASK_KEY}") == "2"
+
+
+class TestProducerGateLua:
+    def test_closed_gate_rejects_all_without_writing_anything(self, live_redis):
+        queue_cls = _make_queue_class(NAMESPACE)
+        # Close the producer gate before enqueuing.
+        live_redis.set(queue_cls.producer_lock_key(), "dispatch:producer_paused")
+
+        statuses = _enqueue(queue_cls, [_job("a"), _job("b")])
+
+        assert statuses == [EnqueueStatus.PRODUCER_REJECTED, EnqueueStatus.PRODUCER_REJECTED]
+        # Nothing written: no pending member, no task_members counter, no dedupe.
+        assert live_redis.zcard(queue_cls.pending_key()) == 0
+        assert live_redis.hgetall(queue_cls.task_members_key()) == {}
+        assert live_redis.exists(queue_cls.dedupe_key(TASK_KEY, "a")) == 0
+
+    def test_closed_gate_beats_dedupe_and_capacity(self, live_redis):
+        """A closed gate must win over dedupe/duplicate and capacity outcomes."""
+        queue_cls = _make_queue_class(NAMESPACE)
+        # Occupied slot + existing dedupe identity for the same work item.
+        _enqueue(queue_cls, [_job("a")])
+        live_redis.set(queue_cls.producer_lock_key(), "dispatch:producer_paused")
+
+        # Same work_item_id again: gate closes before dedupe is even consulted.
+        statuses = _enqueue(queue_cls, [_job("a")], max_admitted_jobs=0)
+
+        assert statuses == [EnqueueStatus.PRODUCER_REJECTED]
+        assert live_redis.zcard(queue_cls.pending_key()) == 1  # unchanged from the first enqueue
+        assert live_redis.hget(queue_cls.task_members_key(), f"pending:{TASK_KEY}") == "1"
+
+    def test_open_gate_allows_enqueue(self, live_redis):
+        queue_cls = _make_queue_class(NAMESPACE)
+
+        assert _enqueue(queue_cls, [_job("a")]) == [EnqueueStatus.ACCEPTED]
+        assert live_redis.zcard(queue_cls.pending_key()) == 1
 
 
 class TestReserveLua:
@@ -168,7 +309,7 @@ class TestFinalizeLua:
             job_id=job.job_id,
             task_key=TASK_KEY,
             work_item_id="a",
-            task_members_ttl=TASK_MEMBERS_TTL_SECONDS,
+            task_members_ttl=TASK_MEMBERS_CACHE_TTL_SECONDS,
         )
 
         assert removed == 1
@@ -192,7 +333,7 @@ class TestRequeueLua:
             job_ttl=300,
             score=time.time(),
             task_key=TASK_KEY,
-            task_members_ttl=TASK_MEMBERS_TTL_SECONDS,
+            task_members_ttl=TASK_MEMBERS_CACHE_TTL_SECONDS,
         )
 
         assert removed == 1
@@ -213,7 +354,7 @@ class TestRequeueLua:
             job_id=job.job_id,
             task_key=TASK_KEY,
             work_item_id="a",
-            task_members_ttl=TASK_MEMBERS_TTL_SECONDS,
+            task_members_ttl=TASK_MEMBERS_CACHE_TTL_SECONDS,
         )
 
         removed = lifecycle.QueueLifecycle.requeue_job(
@@ -223,7 +364,7 @@ class TestRequeueLua:
             job_ttl=300,
             score=time.time(),
             task_key=TASK_KEY,
-            task_members_ttl=TASK_MEMBERS_TTL_SECONDS,
+            task_members_ttl=TASK_MEMBERS_CACHE_TTL_SECONDS,
         )
 
         # No zombie: no payload write, no pending ZADD, no counter move.
@@ -300,3 +441,59 @@ class TestDiscardOrphanedJobScoping:
         )
 
         assert live_redis.get(queue_cls.dedupe_key(TASK_KEY, "item-1")) == "live-job"
+
+
+class TestMultiShardRemap:
+    """Real multi-alias I/O via Redis logical DBs (not mock clients).
+
+    ``transaction=True`` is required so ``DispatchQueueRoute.save``'s
+    ``on_commit`` route-cache invalidation actually runs (plain ``django_db``
+    wraps the test in a non-committing transaction).
+    """
+
+    @pytest.mark.django_db(transaction=True)
+    def test_enqueue_lands_on_routed_shard_only(self, multi_shard_redis):
+        from backend.db_periodic_task.dispatch import routing
+
+        queue_cls = _make_queue_class(NAMESPACE_SHARD)
+        shard0 = multi_shard_redis["dispatch_0"]
+        shard1 = multi_shard_redis["dispatch_1"]
+
+        assert routing.resolve_alias(NAMESPACE_SHARD) == "dispatch_0"
+        assert _enqueue(queue_cls, [_job("a", namespace=NAMESPACE_SHARD)]) == [EnqueueStatus.ACCEPTED]
+
+        assert shard0.zcard(queue_cls.pending_key()) == 1
+        assert _ns_key_count(shard0, NAMESPACE_SHARD) >= 1
+        assert _ns_key_count(shard1, NAMESPACE_SHARD) == 0
+
+    @pytest.mark.django_db(transaction=True)
+    def test_drop_remap_sweeps_old_shard_and_writes_land_on_new(self, multi_shard_redis):
+        from backend.db_periodic_task.dispatch import rebalance, routing
+        from backend.db_periodic_task.models import DispatchQueueRoute
+
+        queue_cls = _make_queue_class(NAMESPACE_SHARD)
+        shard0 = multi_shard_redis["dispatch_0"]
+        shard1 = multi_shard_redis["dispatch_1"]
+
+        assert _enqueue(queue_cls, [_job("before", namespace=NAMESPACE_SHARD)]) == [EnqueueStatus.ACCEPTED]
+        assert shard0.zcard(queue_cls.pending_key()) == 1
+        assert shard1.zcard(queue_cls.pending_key()) == 0
+
+        # Skip the 2×90s convergence sleeps; Redis I/O and sweeps stay real.
+        with patch.object(rebalance, "_wait_convergence_window"):
+            result = rebalance.remap_namespace(NAMESPACE_SHARD, "dispatch_1", mode="drop", dry_run=False)
+
+        assert result["moved"] is True
+        assert result["from_alias"] == "dispatch_0"
+        assert result["to_alias"] == "dispatch_1"
+        assert result["first_sweep"]["deleted"] >= 1
+        assert DispatchQueueRoute.objects.get(namespace=NAMESPACE_SHARD).redis_alias == "dispatch_1"
+        assert routing.resolve_alias(NAMESPACE_SHARD) == "dispatch_1"
+
+        # Old-shard namespace keys (including pause/producer gates) are gone.
+        assert _ns_key_count(shard0, NAMESPACE_SHARD) == 0
+        # Drop-mode does not transfer pending jobs; new writes go to the new shard.
+        assert _enqueue(queue_cls, [_job("after", namespace=NAMESPACE_SHARD)]) == [EnqueueStatus.ACCEPTED]
+        assert shard1.zcard(queue_cls.pending_key()) == 1
+        assert shard0.zcard(queue_cls.pending_key()) == 0
+        assert routing.conn_for_namespace(NAMESPACE_SHARD).connection_pool.connection_kwargs["db"] == _SHARD_DB_1

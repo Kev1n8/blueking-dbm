@@ -44,3 +44,19 @@ class DispatchTaskSettingsAdmin(AuditedDispatchSettingsAdmin):
     search_fields = ["task_key", "queue__namespace"]
     list_filter = ["queue"]
     autocomplete_fields = ["queue"]
+
+
+@admin.register(models.DispatchQueueRoute)
+class DispatchQueueRouteAdmin(AuditedDispatchSettingsAdmin):
+    """Route rows are read-only in admin: remap_namespace() is the mutation path."""
+
+    list_display = ["namespace", "redis_alias", "updater", "update_at"]
+    search_fields = ["namespace", "redis_alias"]
+    readonly_fields = ["namespace", "redis_alias", "creator", "create_at", "updater", "update_at"]
+
+    def has_add_permission(self, request):
+        # Routes are created assign-once by routing.assign_route / bootstrap_routes.
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

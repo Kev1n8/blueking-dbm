@@ -14,6 +14,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Optional, Tuple, Type
 
+from backend.db_periodic_task.dispatch.config import DISPATCH_RATE_LIMIT_COOLDOWN_SECONDS
 from backend.db_periodic_task.dispatch.outcomes import DispatchOutcome, DispatchOutcomeType
 from backend.dbm_aiagent.agent.constants import DBMAgentCode
 from backend.dbm_aiagent.tasks.config import AGENT_RESPONSE_LOG_MAX_CHARS
@@ -97,7 +98,7 @@ class AgentInvoker:
         invoke_timeout_seconds: int,
         retry_count: int = 0,
         max_rate_limit_retries: int = 0,
-        rate_limit_cooldown_seconds: int = 60,
+        rate_limit_cooldown_seconds: int = DISPATCH_RATE_LIMIT_COOLDOWN_SECONDS,
         work_item_ref: str = "",
     ) -> DispatchOutcome:
         invoke_timeout = max(1, int(invoke_timeout_seconds))

@@ -9,45 +9,56 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import time
 from typing import ClassVar, Optional
 
 from django.utils.module_loading import autodiscover_modules
+from redis import Redis
 
+from backend.db_periodic_task.dispatch import routing
 from backend.db_periodic_task.dispatch.config import (
     DEFAULT_QUEUE_WAIT_TTL_SECONDS,
     DispatchQueueConfig,
     DispatchTaskConfig,
 )
 from backend.db_periodic_task.dispatch.job import DispatchJob, build_job_id
-from backend.db_periodic_task.dispatch.metrics import DispatchMetrics
+from backend.db_periodic_task.dispatch.metrics import METRICS_WINDOW_SECONDS, DispatchMetrics
 from backend.db_periodic_task.dispatch.outcomes import DispatchOutcomeType
-from backend.utils.redis import RedisConn
 
 logger = logging.getLogger("root")
 
 DEFAULT_NAMESPACE = "default"
-TASK_MEMBERS_TTL_SECONDS = DEFAULT_QUEUE_WAIT_TTL_SECONDS
+# Rebuildable membership-hash safety net — independent of per-task wait TTL.
+# Maintenance rebuilds the hash when it expires ahead of long-lived jobs.
+TASK_MEMBERS_CACHE_TTL_SECONDS = DEFAULT_QUEUE_WAIT_TTL_SECONDS
 
-# Global (namespace-agnostic) keys: job payload / dedupe / registered metadata.
-KEY_JOB_PREFIX = "dispatch:job:"
-KEY_DEDUPE_PREFIX = "dispatch:dedupe:"
+# ``dispatch:registered`` is the only namespace-agnostic dispatch key.
 KEY_REGISTERED = "dispatch:registered"
 
+# Namespace-scoped key families. Everything namespace-derivable travels
+# together as ``dispatch:{ns}:*`` so one glob sweeps a whole shard.
+KEY_JOB_PREFIX = "dispatch:{ns}:job:"
+KEY_DEDUPE_PREFIX = "dispatch:{ns}:dedupe:"
+KEY_PRODUCER_LOCK_PREFIX = "dispatch:{ns}:producer_lock"
 
-def set_redis_ttl_marker(key: str, ttl_seconds: int, *, nx: bool = False) -> bool:
+
+def set_redis_ttl_marker(key: str, ttl_seconds: int, *, nx: bool = False, client=None) -> bool:
     """SET ``key`` with a TTL.
 
     With ``nx=True``, acts as a gate: returns True only when the key was absent
     (first caller in the window wins). With ``nx=False``, refreshes the marker.
     """
+    if client is None:
+        raise TypeError("set_redis_ttl_marker requires an explicit client (routing must stay explicit)")
     try:
         ttl = max(1, int(ttl_seconds))
         if nx:
-            return bool(RedisConn.set(key, "1", nx=True, ex=ttl))
-        RedisConn.set(key, "1", ex=ttl)
+            return bool(client.set(key, "1", nx=True, ex=ttl))
+        client.set(key, "1", ex=ttl)
         return True
     except Exception as exc:
         logger.warning("dispatch: set ttl marker key=%s nx=%s failed: %s", key, nx, exc)
@@ -93,9 +104,10 @@ class DispatchQueue:
         class AITaskQueue(DispatchQueue):
             config_cls = AITaskQueueConfig
 
-    Global job data, outcomes, and registration metadata stay on this class.
-    Queue operations bind to ``cls.namespace``. Cross-queue helpers iterate
-    queues registered in ``DISPATCH_QUEUE_REGISTRY``.
+    Job data, outcomes, and queue operations bind to ``cls.namespace`` and
+    travel together on that namespace's Redis shard; only registration
+    metadata (``dispatch:registered``) stays global. Cross-queue helpers
+    iterate queues registered in ``DISPATCH_QUEUE_REGISTRY``.
 
     Registration contract
     ----------------------
@@ -127,6 +139,10 @@ class DispatchQueue:
         # abstract base (namespace == "") is skipped.
         if not cls.namespace:
             return
+        try:
+            routing.validate_namespace(cls.namespace)
+        except Exception as exc:
+            raise DispatchQueueError(f"invalid dispatch queue namespace {cls.namespace!r}: {exc}") from exc
         incumbent = DISPATCH_QUEUE_REGISTRY.get(cls.namespace)
         # Same class re-registered (idempotent import): keep as-is.
         if incumbent is None or incumbent is cls:
@@ -201,6 +217,11 @@ class DispatchQueue:
         return cls.namespace or DEFAULT_NAMESPACE
 
     @classmethod
+    def conn(cls) -> Redis[str]:
+        """The Redis connection owning this namespace's dispatch keys."""
+        return routing.conn_for_namespace(cls._ns())
+
+    @classmethod
     def load_config(cls) -> DispatchQueueConfig:
         return cls.config_cls.from_db()
 
@@ -214,11 +235,11 @@ class DispatchQueue:
 
     @classmethod
     def dedupe_key(cls, task_key: str, work_item_id: str) -> str:
-        return f"{KEY_DEDUPE_PREFIX}{cls._ns()}:{task_key}:{work_item_id}"
+        return f"{KEY_DEDUPE_PREFIX.format(ns=cls._ns())}{task_key}:{work_item_id}"
 
     @classmethod
     def dedupe_key_for_namespace(cls, namespace: str, task_key: str, work_item_id: str) -> str:
-        return f"{KEY_DEDUPE_PREFIX}{namespace or DEFAULT_NAMESPACE}:{task_key}:{work_item_id}"
+        return f"{KEY_DEDUPE_PREFIX.format(ns=namespace or DEFAULT_NAMESPACE)}{task_key}:{work_item_id}"
 
     @classmethod
     def tick_counter_key(cls, tick_id: int) -> str:
@@ -227,6 +248,11 @@ class DispatchQueue:
     @classmethod
     def task_members_key(cls) -> str:
         return f"dispatch:{cls._ns()}:task_members"
+
+    @classmethod
+    def producer_lock_key(cls) -> str:
+        """Producer-gate key; admission rejects ``submit`` while it exists."""
+        return KEY_PRODUCER_LOCK_PREFIX.format(ns=cls._ns())
 
     @classmethod
     def _pending_member_field(cls, task_key: str) -> str:
@@ -239,22 +265,22 @@ class DispatchQueue:
     @classmethod
     def _member_count_for_task(cls, field: str) -> int:
         try:
-            return int(RedisConn.hget(cls.task_members_key(), field) or 0)
+            return int(cls.conn().hget(cls.task_members_key(), field) or 0)
         except Exception as exc:
             logger.warning("dispatch: hget task_members field=%s failed: %s", field, exc)
             return -1
 
     # ------------------------------------------------------------------ #
-    # Global (namespace-agnostic) job-record storage
+    # Namespace-scoped job-record storage
     # ------------------------------------------------------------------ #
     @classmethod
     def _job_key(cls, job_id: str) -> str:
-        return f"{KEY_JOB_PREFIX}{job_id}"
+        return f"{KEY_JOB_PREFIX.format(ns=cls._ns())}{job_id}"
 
     @classmethod
     def get_job(cls, job_id: str) -> Optional[DispatchJob]:
         try:
-            raw = RedisConn.get(cls._job_key(job_id))
+            raw = cls.conn().get(cls._job_key(job_id))
             if not raw:
                 return None
             return DispatchJob.from_dict(json.loads(raw))
@@ -268,7 +294,7 @@ class DispatchQueue:
         if not job_ids:
             return {}
         try:
-            raw_jobs = RedisConn.mget([cls._job_key(job_id) for job_id in job_ids])
+            raw_jobs = cls.conn().mget([cls._job_key(job_id) for job_id in job_ids])
         except Exception as exc:
             logger.warning("dispatch: get_jobs failed namespace=%s: %s", cls._ns(), exc)
             return {}
@@ -295,7 +321,7 @@ class DispatchQueue:
         """Read ready candidates without changing queue membership."""
         try:
             now = now or time.time()
-            raw_ids = RedisConn.zrangebyscore(
+            raw_ids = cls.conn().zrangebyscore(
                 cls.pending_key(),
                 "-inf",
                 now,
@@ -364,7 +390,7 @@ class DispatchQueue:
         return DEFAULT_EXECUTION_TIMEOUT_SECONDS + INFLIGHT_TTL_MARGIN_SECONDS
 
     # ------------------------------------------------------------------ #
-    # Outcomes / registered metadata (global)
+    # Outcomes / registered metadata
     # ------------------------------------------------------------------ #
     @classmethod
     def record_outcome(
@@ -389,7 +415,7 @@ class DispatchQueue:
     @classmethod
     def register_task_metadata(cls, task_key: str, metadata: dict) -> None:
         try:
-            RedisConn.hset(KEY_REGISTERED, task_key, json.dumps(metadata, ensure_ascii=False))
+            routing.global_conn().hset(KEY_REGISTERED, task_key, json.dumps(metadata, ensure_ascii=False))
             cls.reconcile_registered_metadata()
         except Exception as exc:
             logger.warning("dispatch: register_task_metadata failed: %s", exc)
@@ -411,7 +437,7 @@ class DispatchQueue:
             if namespace:
                 known_namespaces.add(namespace)
         try:
-            raw = RedisConn.hgetall(KEY_REGISTERED) or {}
+            raw = routing.global_conn().hgetall(KEY_REGISTERED) or {}
         except Exception as exc:
             logger.warning("dispatch: reconcile_registered_metadata hgetall failed: %s", exc)
             return 0
@@ -435,7 +461,7 @@ class DispatchQueue:
         if not stale:
             return 0
         try:
-            RedisConn.hdel(KEY_REGISTERED, *stale)
+            routing.global_conn().hdel(KEY_REGISTERED, *stale)
         except Exception as exc:
             logger.warning("dispatch: reconcile_registered_metadata hdel failed: %s", exc)
             return 0
@@ -446,8 +472,9 @@ class DispatchQueue:
     def outcomes_for_task(cls, task_key: str) -> dict[str, int]:
         now = time.time()
         counters = DispatchMetrics.aggregate_task_counters(
+            cls._ns(),
             task_key,
-            start_at=now - 24 * 60 * 60,
+            start_at=now - METRICS_WINDOW_SECONDS,
             end_at=now,
         )
         return {
@@ -460,14 +487,14 @@ class DispatchQueue:
     @classmethod
     def pending_count(cls) -> int:
         try:
-            return int(RedisConn.zcard(cls.pending_key()) or 0)
+            return int(cls.conn().zcard(cls.pending_key()) or 0)
         except Exception:
             return -1
 
     @classmethod
     def inflight_count(cls) -> int:
         try:
-            return int(RedisConn.zcard(cls.inflight_key()) or 0)
+            return int(cls.conn().zcard(cls.inflight_key()) or 0)
         except Exception:
             return -1
 
@@ -475,7 +502,7 @@ class DispatchQueue:
     def delaying_count(cls, now: Optional[float] = None) -> int:
         try:
             now = now or time.time()
-            return int(RedisConn.zcount(cls.pending_key(), now, "+inf") or 0)
+            return int(cls.conn().zcount(cls.pending_key(), now, "+inf") or 0)
         except Exception:
             return -1
 
@@ -483,7 +510,7 @@ class DispatchQueue:
     def ready_count(cls, now: Optional[float] = None) -> int:
         try:
             now = now or time.time()
-            return int(RedisConn.zcount(cls.pending_key(), "-inf", now) or 0)
+            return int(cls.conn().zcount(cls.pending_key(), "-inf", now) or 0)
         except Exception:
             return -1
 
@@ -532,7 +559,7 @@ class DispatchQueue:
         """Return pending and inflight counts in one Redis round trip."""
         fields = [cls._pending_member_field(task_key), cls._inflight_member_field(task_key)]
         try:
-            values = RedisConn.hmget(cls.task_members_key(), fields) or []
+            values = cls.conn().hmget(cls.task_members_key(), fields) or []
             counts = [int(value or 0) for value in values]
             if len(counts) != len(fields):
                 return -1, -1

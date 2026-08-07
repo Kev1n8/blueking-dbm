@@ -17,22 +17,26 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
+from backend.db_periodic_task.dispatch import routing
 from backend.db_periodic_task.dispatch.config import PUMP_INTERVAL_SECONDS
+from backend.db_periodic_task.dispatch.lua import compile_script, eval_script
 from backend.db_periodic_task.dispatch.outcomes import DispatchOutcomeType
-from backend.utils.redis import RedisConn
 
 logger = logging.getLogger("root")
 
-METRICS_RETENTION_SECONDS = 25 * 60 * 60
-METRICS_WINDOW_SECONDS = 24 * 60 * 60
-RESERVOIR_SIZE = 128
-DISTRIBUTION_SAMPLE_DENOMINATOR = 10
 HOUR_SECONDS = 60 * 60
 MINUTE_SECONDS = 60
+# Reportable lookback and Redis hash retention share one window source so a
+# retention shorter than the window cannot silently drop the newest hour.
+METRICS_WINDOW_SECONDS = 24 * HOUR_SECONDS
+METRICS_RETENTION_SECONDS = METRICS_WINDOW_SECONDS + HOUR_SECONDS
+RESERVOIR_SIZE = 128
+DISTRIBUTION_SAMPLE_DENOMINATOR = 10
 
-KEY_QUEUE_METRICS_PREFIX = "dispatch:metrics:queue:"
-KEY_TASK_METRICS_PREFIX = "dispatch:metrics:task:"
-KEY_SAMPLE_METRICS_PREFIX = "dispatch:metrics:sample:"
+# Namespace-scoped metric key families (``dispatch:{ns}:*`` layout).
+KEY_QUEUE_METRICS_PREFIX = "dispatch:{ns}:metrics:queue:"
+KEY_TASK_METRICS_PREFIX = "dispatch:{ns}:metrics:task:"
+KEY_SAMPLE_METRICS_PREFIX = "dispatch:{ns}:metrics:sample:"
 
 # Known per-tick queue counter names. ``queue_tick_counts`` HMGETs these instead of
 # HGETALL on the hourly hash (which accumulates thousands of fields). Add new
@@ -125,15 +129,15 @@ def _hour_ids(start_at: float, end_at: float) -> range:
 
 
 def _queue_key(namespace: str, hour_id: int) -> str:
-    return f"{KEY_QUEUE_METRICS_PREFIX}{namespace}:{hour_id}"
+    return f"{KEY_QUEUE_METRICS_PREFIX.format(ns=namespace)}{hour_id}"
 
 
-def _task_key(task_key: str, hour_id: int) -> str:
-    return f"{KEY_TASK_METRICS_PREFIX}{task_key}:{hour_id}"
+def _task_key(namespace: str, task_key: str, hour_id: int) -> str:
+    return f"{KEY_TASK_METRICS_PREFIX.format(ns=namespace)}{task_key}:{hour_id}"
 
 
 def _sample_key(namespace: str, hour_id: int) -> str:
-    return f"{KEY_SAMPLE_METRICS_PREFIX}{namespace}:{hour_id}"
+    return f"{KEY_SAMPLE_METRICS_PREFIX.format(ns=namespace)}{hour_id}"
 
 
 def _queue_tick_field(timestamp: float, name: str) -> str:
@@ -173,7 +177,7 @@ class DispatchMetrics:
         """Return Redis keys/field prefixes for atomic admission metrics."""
         observed_at = time.time() if timestamp is None else timestamp
         return (
-            _task_key(task_key, _hour_id(observed_at)),
+            _task_key(namespace, task_key, _hour_id(observed_at)),
             _queue_key(namespace, _hour_id(observed_at)),
             _task_minute_field(observed_at, ""),
             _queue_tick_field(observed_at, ""),
@@ -183,19 +187,19 @@ class DispatchMetrics:
     @classmethod
     def _get_counter_script(cls):
         if cls._counter_script is None:
-            cls._counter_script = RedisConn.register_script(RECORD_COUNTER_LUA)
+            cls._counter_script = compile_script(RECORD_COUNTER_LUA)
         return cls._counter_script
 
     @classmethod
     def _get_reservoir_script(cls):
         if cls._reservoir_script is None:
-            cls._reservoir_script = RedisConn.register_script(RECORD_RESERVOIR_LUA)
+            cls._reservoir_script = compile_script(RECORD_RESERVOIR_LUA)
         return cls._reservoir_script
 
     @classmethod
     def _get_reservoir_batch_script(cls):
         if cls._reservoir_batch_script is None:
-            cls._reservoir_batch_script = RedisConn.register_script(RECORD_RESERVOIR_BATCH_LUA)
+            cls._reservoir_batch_script = compile_script(RECORD_RESERVOIR_BATCH_LUA)
         return cls._reservoir_batch_script
 
     @staticmethod
@@ -207,11 +211,12 @@ class DispatchMetrics:
         return int.from_bytes(digest, "big") % DISTRIBUTION_SAMPLE_DENOMINATOR == 0
 
     @classmethod
-    def _record_counter(cls, key: str, field_name: str, amount: int = 1, *, client=None) -> None:
-        cls._get_counter_script()(
+    def _record_counter(cls, key: str, field_name: str, amount: int = 1, *, client) -> None:
+        eval_script(
+            cls._get_counter_script(),
+            client=client,
             keys=[key],
             args=[field_name, int(amount), METRICS_RETENTION_SECONDS],
-            client=client,
         )
 
     @classmethod
@@ -226,6 +231,7 @@ class DispatchMetrics:
     ) -> None:
         observed_at = time.time() if timestamp is None else timestamp
         try:
+            client = client or routing.conn_for_namespace(namespace)
             cls._record_counter(
                 _queue_key(namespace, _hour_id(observed_at)),
                 _queue_tick_field(observed_at, name),
@@ -238,6 +244,7 @@ class DispatchMetrics:
     @classmethod
     def record_task_counter(
         cls,
+        namespace: str,
         task_key: str,
         name: str,
         amount: int = 1,
@@ -247,8 +254,9 @@ class DispatchMetrics:
     ) -> None:
         observed_at = time.time() if timestamp is None else timestamp
         try:
+            client = client or routing.conn_for_namespace(namespace)
             cls._record_counter(
-                _task_key(task_key, _hour_id(observed_at)),
+                _task_key(namespace, task_key, _hour_id(observed_at)),
                 _task_minute_field(observed_at, name),
                 amount,
                 client=client,
@@ -260,8 +268,8 @@ class DispatchMetrics:
     def record_enqueue_outcome(cls, namespace: str, task_key: str, name: str, amount: int = 1) -> None:
         """Record a producer outcome when admission Lua could not do so."""
         try:
-            pipe = RedisConn.pipeline(transaction=False)
-            cls.record_task_counter(task_key, name, amount=amount, client=pipe)
+            pipe = routing.conn_for_namespace(namespace).pipeline(transaction=False)
+            cls.record_task_counter(namespace, task_key, name, amount=amount, client=pipe)
             cls.record_queue_counter(namespace, name, amount=amount, client=pipe)
             pipe.execute()
         except Exception as exc:
@@ -284,7 +292,10 @@ class DispatchMetrics:
             return
         observed_at = time.time() if timestamp is None else timestamp
         try:
-            cls._get_reservoir_script()(
+            client = client or routing.conn_for_namespace(namespace)
+            eval_script(
+                cls._get_reservoir_script(),
+                client=client,
                 keys=[_sample_key(namespace, _hour_id(observed_at))],
                 args=[
                     metric_name,
@@ -293,7 +304,6 @@ class DispatchMetrics:
                     METRICS_RETENTION_SECONDS,
                     random.getrandbits(31),
                 ],
-                client=client,
             )
         except Exception as exc:
             logger.debug("dispatch metrics: reservoir failed namespace=%s metric=%s: %s", namespace, metric_name, exc)
@@ -317,6 +327,7 @@ class DispatchMetrics:
         ]
         if not selected:
             return
+        client = client or routing.conn_for_namespace(namespace)
         args: list[object] = [
             metric_name,
             RESERVOIR_SIZE,
@@ -326,10 +337,11 @@ class DispatchMetrics:
         for value in selected:
             args.extend([f"{observed_at}:{value!r}", random.getrandbits(31)])
         try:
-            cls._get_reservoir_batch_script()(
+            eval_script(
+                cls._get_reservoir_batch_script(),
+                client=client,
                 keys=[_sample_key(namespace, _hour_id(observed_at))],
                 args=args,
-                client=client,
             )
         except Exception as exc:
             logger.debug(
@@ -351,8 +363,9 @@ class DispatchMetrics:
     ) -> None:
         observed_at = time.time() if timestamp is None else timestamp
         try:
-            pipe = RedisConn.pipeline(transaction=False)
+            pipe = routing.conn_for_namespace(namespace).pipeline(transaction=False)
             cls.record_task_counter(
+                namespace,
                 task_key,
                 f"outcome:{outcome.value}",
                 timestamp=observed_at,
@@ -393,7 +406,9 @@ class DispatchMetrics:
         if not field_names:
             return {}
         redis_fields = [_queue_tick_field(timestamp, name) for name in field_names]
-        values = RedisConn.hmget(_queue_key(namespace, _hour_id(timestamp)), redis_fields) or []
+        values = (
+            routing.conn_for_namespace(namespace).hmget(_queue_key(namespace, _hour_id(timestamp)), redis_fields) or []
+        )
         result: dict[str, int] = {}
         for name, raw_value in zip(field_names, values):
             if raw_value is None:
@@ -413,7 +428,7 @@ class DispatchMetrics:
         result: dict[str, int] = {}
         for hour_id in _hour_ids(start_at, end_at):
             try:
-                raw = RedisConn.hgetall(_queue_key(namespace, hour_id)) or {}
+                raw = routing.conn_for_namespace(namespace).hgetall(_queue_key(namespace, hour_id)) or {}
             except Exception:
                 continue
             for raw_field, raw_value in raw.items():
@@ -429,6 +444,7 @@ class DispatchMetrics:
     @classmethod
     def aggregate_task_counters(
         cls,
+        namespace: str,
         task_key: str,
         *,
         start_at: float,
@@ -438,7 +454,7 @@ class DispatchMetrics:
         result: dict[str, int] = {}
         for hour_id in _hour_ids(start_at, end_at):
             try:
-                raw = RedisConn.hgetall(_task_key(task_key, hour_id)) or {}
+                raw = routing.conn_for_namespace(namespace).hgetall(_task_key(namespace, task_key, hour_id)) or {}
             except Exception:
                 continue
             for raw_field, raw_value in raw.items():
@@ -465,7 +481,7 @@ class DispatchMetrics:
         seen = 0
         for hour_id in _hour_ids(start_at, end_at):
             try:
-                raw = RedisConn.hgetall(_sample_key(namespace, hour_id)) or {}
+                raw = routing.conn_for_namespace(namespace).hgetall(_sample_key(namespace, hour_id)) or {}
             except Exception:
                 continue
             hour_seen = int(raw.get(f"r:{metric_name}:seen", raw.get(f"r:{metric_name}:seen".encode(), 0)) or 0)

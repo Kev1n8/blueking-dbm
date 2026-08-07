@@ -15,14 +15,10 @@ import time
 from dataclasses import replace
 from enum import IntEnum
 
-from backend.db_periodic_task.dispatch.config import (
-    DEFAULT_QUEUE_WAIT_TTL_SECONDS,
-    PUMP_INTERVAL_SECONDS,
-    DispatchQueueConfig,
-)
+from backend.db_periodic_task.dispatch.config import PUMP_INTERVAL_SECONDS, DispatchQueueConfig
 from backend.db_periodic_task.dispatch.job import DispatchJob
-from backend.db_periodic_task.dispatch.lua import register_script_once
-from backend.db_periodic_task.dispatch.queue import DispatchQueue
+from backend.db_periodic_task.dispatch.lua import compile_script, eval_script
+from backend.db_periodic_task.dispatch.queue import TASK_MEMBERS_CACHE_TTL_SECONDS, DispatchQueue
 
 logger = logging.getLogger("root")
 
@@ -104,7 +100,7 @@ class ReservationStatus(IntEnum):
 class QueueReservation:
     """Atomically reserve FIFO jobs under queue inflight and tick ceilings."""
 
-    _reserve_script = register_script_once(RESERVE_JOB_LUA)
+    _reserve_script = compile_script(RESERVE_JOB_LUA)
 
     @classmethod
     def reserve_jobs(
@@ -136,7 +132,7 @@ class QueueReservation:
             max(1, int(tick_budget)),
             TICK_COUNTER_TTL_SECONDS,
             len(jobs),
-            DEFAULT_QUEUE_WAIT_TTL_SECONDS,
+            TASK_MEMBERS_CACHE_TTL_SECONDS,
         ]
         for job, record_ttl in zip(jobs, record_ttls):
             reserved_job = replace(job, queue_deadline_at=0.0)
@@ -155,7 +151,7 @@ class QueueReservation:
                 ]
             )
         try:
-            results = cls._reserve_script(keys=keys, args=args)
+            results = eval_script(cls._reserve_script, client=queue_cls.conn(), keys=keys, args=args)
         except Exception as exc:
             logger.warning(
                 "dispatch: reserve_jobs failed namespace=%s count=%d: %s",

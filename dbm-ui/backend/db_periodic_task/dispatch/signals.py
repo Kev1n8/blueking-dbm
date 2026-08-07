@@ -62,26 +62,25 @@ def dispatch_failure_handler(sender=None, task_id=None, exception=None, args=Non
         return
 
     try:
+        from backend.db_periodic_task.dispatch.base import DispatchTask
         from backend.db_periodic_task.dispatch.lifecycle import QueueLifecycle
         from backend.db_periodic_task.dispatch.metrics import DispatchMetrics
-        from backend.db_periodic_task.dispatch.queue import DispatchQueue
 
         job_id = str(args[0]) if args else ""
         if not job_id:
             return
-        job = DispatchQueue.get_job(job_id)
+        job = DispatchTask.fetch_queued_job(job_id)
         if not job:
             # Already finalized / TTL expired — nothing to drop.
             return
 
         DispatchMetrics.record_queue_counter(job.namespace, "celery_failure")
-        DispatchMetrics.record_task_counter(job.task_key, "celery_failure")
-        queue_cls = DispatchQueue.queue_for_namespace(job.namespace)
-        if queue_cls is None:
-            # Owning queue module is gone (removed app / failed discovery):
-            # finalize through a throwaway queue bound to the job's namespace
-            # so cleanup touches the keys where the job was actually reserved.
-            queue_cls = DispatchQueue.ephemeral_queue_for_namespace(job.namespace)
+        DispatchMetrics.record_task_counter(job.namespace, job.task_key, "celery_failure")
+        from backend.db_periodic_task.dispatch.queue import DispatchQueue
+
+        queue_cls = DispatchQueue.queue_for_namespace(job.namespace) or DispatchQueue.ephemeral_queue_for_namespace(
+            job.namespace
+        )
         queue_cls.record_outcome(job.task_key, DispatchOutcomeType.ERROR)
         QueueLifecycle.finalize_job(
             queue_cls=queue_cls,

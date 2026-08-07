@@ -64,6 +64,7 @@ class TestAgentCheckTaskFailureHandler:
     def test_worker_lost_drops_inflight_when_job_exists(self, ai_tasks):
         from billiard.exceptions import WorkerLostError
 
+        from backend.db_periodic_task.dispatch.base import DispatchTask
         from backend.db_periodic_task.dispatch.outcomes import DispatchOutcomeType
         from backend.db_periodic_task.dispatch.queue import DispatchQueue
 
@@ -73,7 +74,7 @@ class TestAgentCheckTaskFailureHandler:
         job.work_item_id = "item-1"
         queue_cls = MagicMock()
         with (
-            patch.object(DispatchQueue, "get_job", return_value=job) as get_job,
+            patch.object(DispatchTask, "fetch_queued_job", return_value=job) as fetch_job,
             patch.object(DispatchQueue, "queue_for_namespace", return_value=queue_cls),
             patch("backend.db_periodic_task.dispatch.lifecycle.QueueLifecycle.finalize_job") as lifecycle_finalize,
             patch("backend.db_periodic_task.dispatch.metrics.DispatchMetrics.record_queue_counter") as record_queue,
@@ -85,9 +86,9 @@ class TestAgentCheckTaskFailureHandler:
                 args=["dummy.smoke:item-1"],
             )
 
-        get_job.assert_called_once_with("dummy.smoke:item-1")
+        fetch_job.assert_called_once_with("dummy.smoke:item-1")
         record_queue.assert_called_once_with("ai", "celery_failure")
-        record_task.assert_called_once_with("dummy.smoke", "celery_failure")
+        record_task.assert_called_once_with("ai", "dummy.smoke", "celery_failure")
         queue_cls.record_outcome.assert_called_once_with("dummy.smoke", DispatchOutcomeType.ERROR)
         lifecycle_finalize.assert_called_once_with(
             queue_cls=queue_cls,
@@ -99,6 +100,7 @@ class TestAgentCheckTaskFailureHandler:
     def test_worker_lost_finalizes_in_job_namespace_when_queue_unregistered(self):
         from billiard.exceptions import WorkerLostError
 
+        from backend.db_periodic_task.dispatch.base import DispatchTask
         from backend.db_periodic_task.dispatch.queue import DISPATCH_QUEUE_REGISTRY, DispatchQueue
 
         job = MagicMock()
@@ -106,7 +108,7 @@ class TestAgentCheckTaskFailureHandler:
         job.task_key = "gone.task"
         job.work_item_id = "item-1"
         with (
-            patch.object(DispatchQueue, "get_job", return_value=job),
+            patch.object(DispatchTask, "fetch_queued_job", return_value=job),
             patch.object(DispatchQueue, "queue_for_namespace", return_value=None),
             patch.object(DispatchQueue, "record_outcome") as record_outcome,
             patch("backend.db_periodic_task.dispatch.lifecycle.QueueLifecycle.finalize_job") as lifecycle_finalize,
@@ -130,10 +132,10 @@ class TestAgentCheckTaskFailureHandler:
     def test_worker_lost_ignores_missing_job(self):
         from billiard.exceptions import WorkerLostError
 
-        from backend.db_periodic_task.dispatch.queue import DispatchQueue
+        from backend.db_periodic_task.dispatch.base import DispatchTask
 
         with (
-            patch.object(DispatchQueue, "get_job", return_value=None) as get_job,
+            patch.object(DispatchTask, "fetch_queued_job", return_value=None) as fetch_job,
             patch("backend.db_periodic_task.dispatch.lifecycle.QueueLifecycle.finalize_job") as finalize_job,
         ):
             self._fire(
@@ -142,12 +144,13 @@ class TestAgentCheckTaskFailureHandler:
                 args=["gone:job"],
             )
 
-        get_job.assert_called_once_with("gone:job")
+        fetch_job.assert_called_once_with("gone:job")
         finalize_job.assert_not_called()
 
     def test_hard_time_limit_drops_inflight_when_job_exists(self):
         from celery.exceptions import TimeLimitExceeded
 
+        from backend.db_periodic_task.dispatch.base import DispatchTask
         from backend.db_periodic_task.dispatch.outcomes import DispatchOutcomeType
         from backend.db_periodic_task.dispatch.queue import DispatchQueue
 
@@ -157,7 +160,7 @@ class TestAgentCheckTaskFailureHandler:
         job.work_item_id = "item-1"
         queue_cls = MagicMock()
         with (
-            patch.object(DispatchQueue, "get_job", return_value=job),
+            patch.object(DispatchTask, "fetch_queued_job", return_value=job),
             patch.object(DispatchQueue, "queue_for_namespace", return_value=queue_cls),
             patch("backend.db_periodic_task.dispatch.lifecycle.QueueLifecycle.finalize_job") as lifecycle_finalize,
             patch("backend.db_periodic_task.dispatch.metrics.DispatchMetrics.record_queue_counter"),
@@ -182,10 +185,10 @@ class TestAgentCheckTaskFailureHandler:
     def test_soft_time_limit_does_not_drop_inflight(self):
         from celery.exceptions import SoftTimeLimitExceeded
 
-        from backend.db_periodic_task.dispatch.queue import DispatchQueue
+        from backend.db_periodic_task.dispatch.base import DispatchTask
 
         with (
-            patch.object(DispatchQueue, "get_job") as get_job,
+            patch.object(DispatchTask, "fetch_queued_job") as fetch_job,
             patch("backend.db_periodic_task.dispatch.lifecycle.QueueLifecycle.finalize_job") as finalize_job,
         ):
             self._fire(
@@ -196,20 +199,20 @@ class TestAgentCheckTaskFailureHandler:
 
         # A soft limit is advisory only: the task is still executing, so the
         # inflight slot must stay reserved.
-        get_job.assert_not_called()
+        fetch_job.assert_not_called()
         finalize_job.assert_not_called()
 
     def test_generic_exception_does_not_drop_inflight(self, ai_tasks, caplog):
-        from backend.db_periodic_task.dispatch.queue import DispatchQueue
+        from backend.db_periodic_task.dispatch.base import DispatchTask
 
         caplog.set_level("ERROR")
         with (
-            patch.object(DispatchQueue, "get_job") as get_job,
+            patch.object(DispatchTask, "fetch_queued_job") as fetch_job,
             patch("backend.db_periodic_task.dispatch.lifecycle.QueueLifecycle.finalize_job") as finalize_job,
         ):
             self._fire(sender=self._sender(), exception=RuntimeError("boom"), args=["x:y"])
         assert f"outcome={ai_tasks.DispatchOutcomeType.ERROR}" in caplog.text
-        get_job.assert_not_called()
+        fetch_job.assert_not_called()
         finalize_job.assert_not_called()
 
     def test_no_exception_still_logs_without_crash(self, caplog):
