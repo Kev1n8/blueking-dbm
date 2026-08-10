@@ -13,7 +13,11 @@ from backend.db_periodic_task.local_tasks.context_manager import start_new_span 
 from backend.db_periodic_task.register import register_periodic_task, registered_local_tasks  # isort:skip
 from backend.db_periodic_task.constants import PeriodicTaskType  # isort:skip
 
-from backend.db_periodic_task.dispatch import maintenance, pump  # noqa: F401  # isort:skip — registers dispatch beats
+from backend.db_periodic_task.dispatch import (  # noqa: F401  # isort:skip — registers dispatch beats
+    maintenance,
+    pump,
+    stats_publisher,
+)
 
 # 再导入各个任务模块
 from backend.db_periodic_task.local_tasks.ai_mysql_tasks.mysql_slowlog_analysis import *

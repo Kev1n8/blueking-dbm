@@ -329,11 +329,13 @@ class TaskDispatchReport:
     counters: dict[str, int]
     outcomes: dict[str, int]
     partial: bool = False
+    namespace: str = ""
 
     def format_summary(self) -> str:
         values = ", ".join(f"{key}={value}" for key, value in sorted(self.counters.items())) or "no metrics"
         return (
-            f"dispatch task[{self.task_key}] window={self.window_seconds}s partial={self.partial}\n"
+            f"dispatch task[{self.task_key}] ns={self.namespace or '?'} "
+            f"window={self.window_seconds}s partial={self.partial}\n"
             f"  pending={self.pending} inflight={self.inflight} backlog={self.backlog}\n"
             f"  {values}"
         )
@@ -351,6 +353,7 @@ class DispatchStatsSnapshot:
     pump_config: dict[str, Any]
     queues: list[QueueDispatchReport]
     outcomes_by_task: list[TaskOutcomeStats]
+    task_reports: list[TaskDispatchReport] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -364,6 +367,7 @@ class DispatchStatsSnapshot:
             "pump_config": self.pump_config,
             "queues": [asdict(item) for item in self.queues],
             "outcomes_by_task": [asdict(item) for item in self.outcomes_by_task],
+            "task_reports": [asdict(item) for item in self.task_reports],
         }
 
     def format_summary(self) -> str:
@@ -374,6 +378,9 @@ class DispatchStatsSnapshot:
             f"  registered_tasks={len(self.registered)}",
         ]
         lines.extend(report.format_summary() for report in self.queues)
+        if self.task_reports:
+            lines.append(f"  tasks={len(self.task_reports)}")
+            lines.extend(report.format_summary() for report in self.task_reports)
         return "\n".join(lines)
 
     def format_dashboard(self) -> str:
@@ -520,6 +527,7 @@ class DispatchStats:
         }
         return TaskDispatchReport(
             task_key=task_key,
+            namespace=namespace,
             timestamp=now,
             window_seconds=window_seconds,
             pending=pending,
@@ -617,30 +625,43 @@ class DispatchStats:
         now = time.time()
         window_seconds = cls._window(window_seconds)
         registered = cls._load_registered()
-        queues = [
-            cls.queue_report(queue_cls.namespace, window_seconds=window_seconds)
-            for queue_cls in DispatchQueue.iter_queues()
-        ]
-        outcomes = []
+        queue_classes = DispatchQueue.iter_queues()
+        queues = [cls.queue_report(queue_cls.namespace, window_seconds=window_seconds) for queue_cls in queue_classes]
+        # Reuse the already-discovered registry (never re-trigger autodiscovery)
+        # so a task's namespace resolves to its owning queue in one traversal.
+        queue_by_ns = {queue_cls.namespace: queue_cls for queue_cls in queue_classes}
+        task_reports: list[TaskDispatchReport] = []
         if include_outcomes:
             for task_key, metadata in registered.items():
                 namespace = metadata.get("namespace", "") if isinstance(metadata, dict) else ""
+                queue_cls = queue_by_ns.get(namespace) if namespace else None
+                pending, inflight = queue_cls.task_counts(task_key) if queue_cls else (-1, -1)
+                backlog = pending + inflight if pending >= 0 and inflight >= 0 else -1
                 counters = DispatchMetrics.aggregate_task_counters(
                     namespace,
                     task_key,
                     start_at=now - window_seconds,
                     end_at=now,
                 )
-                outcomes.append(
-                    TaskOutcomeStats(
+                task_reports.append(
+                    TaskDispatchReport(
                         task_key=task_key,
+                        namespace=namespace,
+                        timestamp=now,
+                        window_seconds=window_seconds,
+                        pending=pending,
+                        inflight=inflight,
+                        backlog=backlog,
+                        counters=counters,
                         outcomes={
                             name.removeprefix("outcome:"): count
                             for name, count in counters.items()
                             if name.startswith("outcome:")
                         },
+                        partial=metadata is None or backlog < 0,
                     )
                 )
+        outcomes = [TaskOutcomeStats(task_key=report.task_key, outcomes=report.outcomes) for report in task_reports]
         return DispatchStatsSnapshot(
             timestamp=now,
             tick_seconds=PUMP_INTERVAL_SECONDS,
@@ -652,6 +673,7 @@ class DispatchStats:
             pump_config=cls._load_pump_config(),
             queues=queues,
             outcomes_by_task=outcomes,
+            task_reports=task_reports,
         )
 
     @staticmethod
@@ -682,6 +704,7 @@ class DispatchStats:
             TaskOutcomeStats(task_key=item["task_key"], outcomes=item.get("outcomes", {}))
             for item in raw.get("outcomes_by_task", [])
         ]
+        task_reports = [TaskDispatchReport(**item) for item in raw.get("task_reports", [])]
         return DispatchStatsSnapshot(
             timestamp=float(raw.get("timestamp", 0)),
             tick_seconds=int(raw.get("tick_seconds", PUMP_INTERVAL_SECONDS)),
@@ -693,4 +716,5 @@ class DispatchStats:
             pump_config=raw.get("pump_config", {}),
             queues=queues,
             outcomes_by_task=outcomes,
+            task_reports=task_reports,
         )
